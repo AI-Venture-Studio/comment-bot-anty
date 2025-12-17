@@ -1,5 +1,6 @@
 import asyncio
 import os
+import sys
 import json
 import random
 import math
@@ -20,11 +21,29 @@ from flasgger import Swagger, swag_from
 dotenv.load_dotenv()
 
 # ===========================================
+# ENVIRONMENT CONFIGURATION
+# ===========================================
+
+# Detect production environment
+IS_PRODUCTION = os.environ.get('RENDER') or os.environ.get('GUNICORN_CMD_ARGS') or 'gunicorn' in os.environ.get('SERVER_SOFTWARE', '')
+
+# Get port from environment (Render provides PORT)
+PORT = int(os.environ.get('PORT', 5001))
+
+# CORS configuration - restrict in production
+ALLOWED_ORIGINS = os.environ.get('ALLOWED_ORIGINS', '*').split(',')
+
+# ===========================================
 # FLASK API SETUP
 # ===========================================
 
 app = Flask(__name__)
-CORS(app)
+
+# Configure CORS
+if IS_PRODUCTION and ALLOWED_ORIGINS != ['*']:
+    CORS(app, origins=ALLOWED_ORIGINS)
+else:
+    CORS(app)
 
 # Swagger configuration
 swagger_config = {
@@ -2657,35 +2676,43 @@ def campaign_polling_worker():
             # Continue polling even if there's an error
 
 
-# Start background worker when running under gunicorn
+# ===========================================
+# BACKGROUND WORKERS
+# ===========================================
+
+_workers_started = False
+
 def start_background_workers():
     """Start background workers for production deployment"""
+    global _workers_started
+    if _workers_started:
+        return  # Prevent double-start
+    
+    _workers_started = True
     polling_thread = threading.Thread(target=campaign_polling_worker, daemon=True)
     polling_thread.start()
     print('[WORKER] Background polling worker started')
 
-# Auto-start workers when imported by gunicorn
-if os.environ.get('GUNICORN_CMD_ARGS') or 'gunicorn' in os.environ.get('SERVER_SOFTWARE', ''):
+
+# Auto-start workers when running under gunicorn or on Render
+if IS_PRODUCTION:
     start_background_workers()
 
 
 if __name__ == '__main__':
-    import sys
-    
     # Check if running as API server or direct automation
     if len(sys.argv) > 1 and sys.argv[1] == 'api':
         # Run Flask API server
         print('[SERVER] Starting Instagram Comment Bot API Server...')
-        print('[API] Documentation: http://localhost:5001/api/docs')
-        print('[API] Current Progress: http://localhost:5001/api/progress/current')
-        print('[API] Event Feed: http://localhost:5001/api/progress/events')
+        print(f'[API] Documentation: http://localhost:{PORT}/api/docs')
+        print(f'[API] Current Progress: http://localhost:{PORT}/api/progress/current')
+        print(f'[API] Event Feed: http://localhost:{PORT}/api/progress/events')
         
         # Check for pending campaigns and auto-start if any exist
         # Only run this in the main process (not in Flask's reloader)
         if os.environ.get('WERKZEUG_RUN_MAIN') == 'true':
             # Start background polling worker for auto-detection
-            polling_thread = threading.Thread(target=campaign_polling_worker, daemon=True)
-            polling_thread.start()
+            start_background_workers()
             
             try:
                 pending = get_next_campaigns()
@@ -2699,7 +2726,7 @@ if __name__ == '__main__':
             except Exception as e:
                 print(f'[WARN] Could not check for pending campaigns: {e}')
         
-        app.run(debug=True, host='0.0.0.0', port=5001, threaded=True)
+        app.run(debug=True, host='0.0.0.0', port=PORT, threaded=True)
     else:
         # Run automation directly
         print('Running automation directly (use "python instagramApp.py api" for API server)')

@@ -4,14 +4,13 @@ services:
     runtime: python
     region: oregon
     plan: starter
-    buildCommand: |
-      pip install -r requirements.txt
-      playwright install chromium
-      playwright install-deps
-    startCommand: gunicorn instagramApp:app --bind 0.0.0.0:$PORT --workers 1 --threads 4 --timeout 120
+    buildCommand: ./build.sh
+    startCommand: gunicorn instagramApp:app --bind 0.0.0.0:$PORT --workers 1 --threads 4 --timeout 300 --preload
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.0
+      - key: RENDER
+        value: "true"
       - key: DOLPHIN_API_TOKEN
         sync: false
       - key: DOLPHIN_LOCAL_API_URL
@@ -20,6 +19,6 @@ services:
         sync: false
       - key: SUPABASE_ANON_KEY
         sync: false
-      - key: SUPABASE_PUBLISHABLE_DEFAULT_KEY
+      - key: ALLOWED_ORIGINS
         sync: false
     healthCheckPath: /health
