@@ -2657,6 +2657,18 @@ def campaign_polling_worker():
             # Continue polling even if there's an error
 
 
+# Start background worker when running under gunicorn
+def start_background_workers():
+    """Start background workers for production deployment"""
+    polling_thread = threading.Thread(target=campaign_polling_worker, daemon=True)
+    polling_thread.start()
+    print('[WORKER] Background polling worker started')
+
+# Auto-start workers when imported by gunicorn
+if os.environ.get('GUNICORN_CMD_ARGS') or 'gunicorn' in os.environ.get('SERVER_SOFTWARE', ''):
+    start_background_workers()
+
+
 if __name__ == '__main__':
     import sys
     

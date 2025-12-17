@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: comment-bot-server
+    runtime: python
+    region: oregon
+    plan: starter
+    buildCommand: |
+      pip install -r requirements.txt
+      playwright install chromium
+      playwright install-deps
+    startCommand: gunicorn instagramApp:app --bind 0.0.0.0:$PORT --workers 1 --threads 4 --timeout 120
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.0
+      - key: DOLPHIN_API_TOKEN
+        sync: false
+      - key: DOLPHIN_LOCAL_API_URL
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_ANON_KEY
+        sync: false
+      - key: SUPABASE_PUBLISHABLE_DEFAULT_KEY
+        sync: false
+    healthCheckPath: /health
