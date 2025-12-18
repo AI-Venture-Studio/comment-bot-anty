@@ -5,7 +5,7 @@ services:
     region: oregon
     plan: starter
     buildCommand: ./build.sh
-    startCommand: gunicorn instagramApp:app --bind 0.0.0.0:$PORT --workers 1 --threads 4 --timeout 300 --preload
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --threads 4 --timeout 300 --preload
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.0
