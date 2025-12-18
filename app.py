@@ -2532,13 +2532,19 @@ async def run_automation_with_dolphin_anty():
                 ws_endpoint = automation_info.get('wsEndpoint')
                 port = automation_info.get('port')
                 
-                # Build the full CDP WebSocket URL
+                # Extract hostname from DOLPHIN_LOCAL_API_URL for remote VPS connections
+                from urllib.parse import urlparse
+                dolphin_url = os.getenv('DOLPHIN_LOCAL_API_URL', 'http://localhost:3001')
+                parsed_url = urlparse(dolphin_url)
+                dolphin_host = parsed_url.hostname or 'localhost'
+                
+                # Build the full CDP WebSocket URL using the Dolphin Anty host
                 if ws_endpoint.startswith('/'):
-                    cdp_url = f"ws://localhost:{port}{ws_endpoint}"
+                    cdp_url = f"ws://{dolphin_host}:{port}{ws_endpoint}"
                 elif ws_endpoint.startswith('ws://') or ws_endpoint.startswith('wss://'):
                     cdp_url = ws_endpoint
                 else:
-                    cdp_url = f"ws://localhost:{port}/{ws_endpoint}"
+                    cdp_url = f"ws://{dolphin_host}:{port}/{ws_endpoint}"
                 
                 print(f'[OK] Profile started!')
                 print(f'   WebSocket Path: {ws_endpoint}')
