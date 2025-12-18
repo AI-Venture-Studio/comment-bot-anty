@@ -1331,6 +1331,56 @@ class InstagramSelectors:
     FIRST_POST = 'article a[href*="/p/"], article a[href*="/reel/"]'
 
 
+async def detect_bot_challenge(page: Page) -> bool:
+    """
+    Detect if Instagram is showing a bot challenge or human verification.
+    
+    Args:
+        page: Playwright page object
+    
+    Returns:
+        True if bot challenge detected, False otherwise
+    """
+    try:
+        page_content = await page.content()
+        
+        # Check for common bot challenge phrases
+        bot_challenge_phrases = [
+            "Prove that you are not a bot",
+            "Confirm you're human",
+            "Confirm you're not a bot",
+            "Verify you're human",
+            "Verify you're not a bot",
+            "We need to confirm that you're human",
+            "Complete the security check",
+            "Suspicious activity",
+            "Unusual activity"
+        ]
+        
+        for phrase in bot_challenge_phrases:
+            if phrase.lower() in page_content.lower():
+                return True
+        
+        # Check for CAPTCHA elements
+        captcha_selectors = [
+            '[name="captcha"]',
+            '#captcha',
+            '.captcha',
+            '[data-testid="captcha"]'
+        ]
+        
+        for selector in captcha_selectors:
+            element = await page.query_selector(selector)
+            if element:
+                return True
+        
+        return False
+        
+    except Exception as e:
+        # If we can't detect, assume no challenge
+        return False
+
+
 async def verify_instagram_login(page: Page) -> bool:
     """
     Verify if we're logged into Instagram.
@@ -1453,6 +1503,10 @@ async def perform_instagram_login(page: Page, username: str, password: str):
     # Wait for page to stabilize
     progress.info('Waiting for login to complete', significant=False)
     await asyncio.sleep(3)
+    
+    # Check for bot challenge
+    if await detect_bot_challenge(page):
+        raise Exception('Instagram bot challenge detected - human verification required')
 
 
 
@@ -1996,11 +2050,18 @@ async def instagram_login(page: Page, username: str, password: str, target_user:
         username: Instagram username/email/phone
         password: Instagram password
         target_user: Instagram username to navigate to
+    
+    Raises:
+        Exception: If bot challenge is detected
     """
     
     # Navigate to Instagram and check if already logged in
     progress.action('Checking login status')
     await navigate_with_retry(page, 'https://www.instagram.com/?hl=en')
+    
+    # Check for bot challenge immediately
+    if await detect_bot_challenge(page):
+        raise Exception('Instagram bot challenge detected - account flagged for verification')
     
     # Verify if we're already logged in
     is_logged_in = await verify_instagram_login(page)
@@ -2011,10 +2072,18 @@ async def instagram_login(page: Page, username: str, password: str, target_user:
         # Not logged in, perform fresh login
         progress.warning('Not logged in, logging in now')
         await perform_instagram_login(page, username, password)
+        
+        # Check for bot challenge after login
+        if await detect_bot_challenge(page):
+            raise Exception('Instagram bot challenge detected - human verification required')
     
     # Navigate to target user's profile with retry
     progress.navigating_to_profile(target_user)
     await navigate_with_retry(page, f'https://www.instagram.com/{target_user}/?hl=en')
+    
+    # Final bot challenge check after navigation
+    if await detect_bot_challenge(page):
+        raise Exception('Instagram bot challenge detected on profile page')
 
 
 # ===========================================
@@ -2568,7 +2637,19 @@ async def run_automation_with_dolphin_anty():
                 
             except Exception as e:
                 print(f'\n[ERR] Account automation error for @{instagram_username}: {e}')
-                progress.error(f'Error with @{instagram_username}: {str(e)[:100]}')
+                
+                # Check if it's a bot challenge error
+                error_msg = str(e)
+                if 'bot challenge' in error_msg.lower() or 'human verification' in error_msg.lower():
+                    print(f'[ERR] Instagram bot challenge detected - marking campaign as failed')
+                    progress.error(f'Instagram requires human verification for @{instagram_username}')
+                    update_campaign_status(campaign_id, 'failed')
+                    all_accounts_successful = False
+                    # Break out of account loop - no point trying other accounts
+                    break
+                else:
+                    progress.error(f'Error with @{instagram_username}: {str(e)[:100]}')
+                
                 account_success = False
                 all_accounts_successful = False
                 
@@ -2605,24 +2686,30 @@ async def run_automation_with_dolphin_anty():
                 'campaign_id': campaign_id,
                 'status': 'completed'
             })
-        else:
-            print(f'\n[WARN] Some accounts failed or encountered errors')
-            campaign_results.append({
-                'campaign_id': campaign_id,
-                'status': 'partial' if any([r for r in campaign_results if r.get('status') == 'completed']) else 'failed'
-            })
-        
-        # ====================================================================
-        # STEP 4: UPDATE STATUS BASED ON RESULT
-        # ====================================================================
-        if campaign_success:
+            # Update to completed
             print(f'\n[STATUS] Updating campaign status to: completed')
             update_campaign_status(campaign_id, 'completed')
             progress.campaign_completed(campaign_id, campaign_idx, len(campaigns))
         else:
-            # Keep status as "not-started" so user can retry
-            print(f'\n[STATUS] Campaign failed - keeping status as not-started for retry')
-            update_campaign_status(campaign_id, 'not-started')
+            print(f'\n[WARN] Some accounts failed or encountered errors')
+            # Check if already marked as failed (bot challenge)
+            # If not, mark as failed now
+            try:
+                supabase = get_supabase_client()
+                current_status = supabase.table('comment_campaigns').select('status').eq('campaign_id', campaign_id).execute()
+                if current_status.data and current_status.data[0]['status'] != 'failed':
+                    print(f'\n[STATUS] Updating campaign status to: failed')
+                    update_campaign_status(campaign_id, 'failed')
+                else:
+                    print(f'\n[STATUS] Campaign already marked as failed')
+            except:
+                print(f'\n[STATUS] Updating campaign status to: failed')
+                update_campaign_status(campaign_id, 'failed')
+            
+            campaign_results.append({
+                'campaign_id': campaign_id,
+                'status': 'failed'
+            })
             progress.error(f'Campaign {campaign_id} failed - check logs for details')
         
         # Delay between campaigns
