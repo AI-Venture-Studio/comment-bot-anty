@@ -1255,12 +1255,24 @@ class DolphinAntyClient:
             print(f'[ERR] Error finding profile by ID: {e}')
             return None
     
-    def start_profile(self, profile_id: int) -> dict | None:
-        """Start a browser profile and return automation info"""
-        response = requests.get(
-            f'{self.local_api_url}/browser_profiles/{profile_id}/start?automation=1',
-            headers=self.headers
-        )
+    def start_profile(self, profile_id: int, headless: bool = None) -> dict | None:
+        """Start a browser profile and return automation info
+        
+        Args:
+            profile_id: The ID of the browser profile to start
+            headless: Run in headless mode (no visible browser window).
+                      If None, defaults to True in production, False locally.
+        """
+        # Default to headless in production environments
+        if headless is None:
+            headless = IS_PRODUCTION
+        
+        # Build URL with headless parameter for production
+        url = f'{self.local_api_url}/browser_profiles/{profile_id}/start?automation=1'
+        if headless:
+            url += '&headless=true'
+        
+        response = requests.get(url, headers=self.headers)
         if response.status_code == 200:
             data = response.json()
             if data.get('success'):
