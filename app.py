@@ -4,6 +4,7 @@ import sys
 import json
 import random
 import math
+import time
 import requests
 import dotenv
 import re
@@ -1255,28 +1256,210 @@ class DolphinAntyClient:
             print(f'[ERR] Error finding profile by ID: {e}')
             return None
     
-    def start_profile(self, profile_id: int, headless: bool = None) -> dict | None:
-        """Start a browser profile and return automation info
+    def _wait_for_port(self, port: int, host: str = 'localhost', timeout: int = 30) -> bool:
+        """
+        Wait until a port is open and accepting connections.
+        
+        This is a minimal readiness check to ensure the browser process
+        has actually bound to the expected port before we attempt CDP connection.
+        
+        Args:
+            port: Port number to check
+            host: Hostname (default: localhost)
+            timeout: Maximum seconds to wait
+            
+        Returns:
+            True if port is open, False if timeout reached
+        """
+        import socket
+        
+        start_time = time.time()
+        poll_interval = 0.5  # Check every 500ms
+        
+        while time.time() - start_time < timeout:
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(2)  # Short timeout for each probe
+                result = sock.connect_ex((host, port))
+                sock.close()
+                
+                if result == 0:
+                    # Port is open
+                    return True
+                    
+            except socket.error:
+                pass  # Port not ready yet
+            
+            time.sleep(poll_interval)
+        
+        return False
+    
+    def _verify_cdp_ready(self, port: int, host: str = 'localhost', timeout: int = 10) -> bool:
+        """
+        Verify that the Chrome DevTools Protocol endpoint is responsive.
+        
+        Sends a simple HTTP request to the CDP JSON endpoint to confirm
+        the browser is ready to accept automation connections.
+        
+        Args:
+            port: CDP port number
+            host: Hostname (default: localhost)
+            timeout: Request timeout in seconds
+            
+        Returns:
+            True if CDP endpoint responds, False otherwise
+        """
+        try:
+            # CDP exposes a JSON endpoint that lists available debugging targets
+            cdp_url = f'http://{host}:{port}/json/version'
+            response = requests.get(cdp_url, timeout=timeout)
+            
+            if response.status_code == 200:
+                # Optionally verify response contains expected CDP info
+                data = response.json()
+                if 'webSocketDebuggerUrl' in data or 'Browser' in data:
+                    return True
+                # Even without expected fields, a 200 response means CDP is up
+                return True
+                
+        except requests.exceptions.RequestException:
+            pass  # CDP not ready or unreachable
+        except Exception:
+            pass  # Unexpected error, treat as not ready
+        
+        return False
+    
+    def start_profile(self, profile_id: int, headless: bool = None, 
+                      max_retries: int = 3, startup_timeout: int = 60) -> dict | None:
+        """
+        Start a browser profile using REST API with readiness verification.
+        
+        This method implements a deterministic startup sequence:
+        1. Call the Dolphin Anty REST endpoint to start the profile
+        2. Wait for the returned port to be open (browser process started)
+        3. Verify the CDP endpoint is responsive (browser ready for automation)
+        4. Return automation info only after readiness is confirmed
+        
+        Retry logic handles transient failures (timeouts, port not ready).
+        Permanent errors (401, 403, 404) fail immediately.
         
         Args:
             profile_id: The ID of the browser profile to start
-            headless: Run in headless mode (no visible browser window).
-                      If None, defaults to True in production, False locally.
+            headless: Run in headless mode. If None, defaults to True in production.
+            max_retries: Number of retry attempts on transient failures (default: 3)
+            startup_timeout: Max seconds to wait for browser readiness (default: 60)
+            
+        Returns:
+            Automation info dict with port and wsEndpoint, or None on failure
         """
         # Default to headless in production environments
         if headless is None:
             headless = IS_PRODUCTION
         
-        # Build URL with headless parameter for production
+        # Build URL with parameters
         url = f'{self.local_api_url}/browser_profiles/{profile_id}/start?automation=1'
         if headless:
             url += '&headless=true'
         
-        response = requests.get(url, headers=self.headers)
-        if response.status_code == 200:
-            data = response.json()
-            if data.get('success'):
-                return data.get('automation', {})
+        last_error = None
+        
+        for attempt in range(max_retries):
+            try:
+                # =============================================================
+                # STEP 1: Call REST API to start the profile
+                # =============================================================
+                response = requests.get(url, headers=self.headers, timeout=30)
+                
+                # Handle permanent errors - fail fast, no retry
+                if response.status_code == 401:
+                    print(f'[ERR] Authentication failed (401) - check API token')
+                    return None
+                if response.status_code == 403:
+                    print(f'[ERR] Access forbidden (403) - insufficient permissions')
+                    return None
+                if response.status_code == 404:
+                    print(f'[ERR] Profile not found (404) - profile ID {profile_id} does not exist')
+                    return None
+                
+                # Handle non-200 responses as transient errors
+                if response.status_code != 200:
+                    last_error = f'REST API returned status {response.status_code}'
+                    print(f'[WARN] Profile start attempt {attempt + 1}/{max_retries}: {last_error}')
+                    if attempt < max_retries - 1:
+                        time.sleep(2 ** attempt)  # Exponential backoff: 1s, 2s, 4s
+                    continue
+                
+                # Parse response
+                data = response.json()
+                if not data.get('success'):
+                    error_msg = data.get('error', 'Unknown error from Dolphin Anty')
+                    last_error = f'Profile start failed: {error_msg}'
+                    print(f'[WARN] Profile start attempt {attempt + 1}/{max_retries}: {last_error}')
+                    if attempt < max_retries - 1:
+                        time.sleep(2 ** attempt)
+                    continue
+                
+                automation_info = data.get('automation', {})
+                port = automation_info.get('port')
+                
+                if not port:
+                    last_error = 'No port returned in automation info'
+                    print(f'[WARN] Profile start attempt {attempt + 1}/{max_retries}: {last_error}')
+                    if attempt < max_retries - 1:
+                        time.sleep(2 ** attempt)
+                    continue
+                
+                # =============================================================
+                # STEP 2: Wait for port to be open (browser process started)
+                # =============================================================
+                port_timeout = min(30, startup_timeout // 2)
+                if not self._wait_for_port(port, timeout=port_timeout):
+                    last_error = f'Timeout waiting for port {port} to open'
+                    print(f'[WARN] Profile start attempt {attempt + 1}/{max_retries}: {last_error}')
+                    # Try to stop the profile before retrying
+                    self.stop_profile(profile_id)
+                    if attempt < max_retries - 1:
+                        time.sleep(2)
+                    continue
+                
+                # =============================================================
+                # STEP 3: Verify CDP endpoint is responsive (browser ready)
+                # =============================================================
+                cdp_timeout = min(10, startup_timeout // 4)
+                if not self._verify_cdp_ready(port, timeout=cdp_timeout):
+                    last_error = f'CDP endpoint not responsive on port {port}'
+                    print(f'[WARN] Profile start attempt {attempt + 1}/{max_retries}: {last_error}')
+                    # Try to stop the profile before retrying
+                    self.stop_profile(profile_id)
+                    if attempt < max_retries - 1:
+                        time.sleep(2)
+                    continue
+                
+                # =============================================================
+                # SUCCESS: Profile started and browser is ready
+                # =============================================================
+                return automation_info
+                
+            except requests.exceptions.Timeout:
+                last_error = 'Request timeout'
+                print(f'[WARN] Profile start attempt {attempt + 1}/{max_retries}: {last_error}')
+                if attempt < max_retries - 1:
+                    time.sleep(2 ** attempt)
+                    
+            except requests.exceptions.ConnectionError:
+                last_error = 'Connection error - Dolphin Anty may not be running'
+                print(f'[WARN] Profile start attempt {attempt + 1}/{max_retries}: {last_error}')
+                if attempt < max_retries - 1:
+                    time.sleep(2 ** attempt)
+                    
+            except Exception as e:
+                last_error = f'Unexpected error: {str(e)}'
+                print(f'[WARN] Profile start attempt {attempt + 1}/{max_retries}: {last_error}')
+                if attempt < max_retries - 1:
+                    time.sleep(2 ** attempt)
+        
+        # All retries exhausted
+        print(f'[ERR] Failed to start profile {profile_id} after {max_retries} attempts: {last_error}')
         return None
     
     def stop_profile(self, profile_id: int) -> bool:
