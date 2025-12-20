@@ -1274,7 +1274,10 @@ class DolphinAntyClient:
         import socket
         
         start_time = time.time()
-        poll_interval = 0.5  # Check every 500ms
+        # Poll interval optimized for AWS Lightsail 2GB instances
+        # 0.75s balances responsiveness with avoiding excessive CPU usage
+        poll_interval = 0.75
+        last_log_time = 0
         
         while time.time() - start_time < timeout:
             try:
@@ -1285,10 +1288,18 @@ class DolphinAntyClient:
                 
                 if result == 0:
                     # Port is open
+                    elapsed = int(time.time() - start_time)
+                    print(f'[OK] Port {port} is now open and ready (took {elapsed}s)')
                     return True
                     
             except socket.error:
                 pass  # Port not ready yet
+            
+            # Log progress every 10 seconds for visibility
+            elapsed = int(time.time() - start_time)
+            if elapsed > 0 and elapsed % 10 == 0 and elapsed != last_log_time:
+                print(f'[WAIT] Still waiting for port {port}... ({elapsed}s/{timeout}s)')
+                last_log_time = elapsed
             
             time.sleep(poll_interval)
         
@@ -1330,31 +1341,43 @@ class DolphinAntyClient:
         return False
     
     def start_profile(self, profile_id: int, headless: bool = None, 
-                      max_retries: int = 3, startup_timeout: int = 60) -> dict | None:
+                      max_retries: int = 3, startup_timeout: int = 120) -> dict | None:
         """
         Start a browser profile using REST API with readiness verification.
         
         This method implements a deterministic startup sequence:
         1. Call the Dolphin Anty REST endpoint to start the profile
-        2. Wait for the returned port to be open (browser process started)
-        3. Verify the CDP endpoint is responsive (browser ready for automation)
-        4. Return automation info only after readiness is confirmed
+        2. Initial grace period (10s) to allow browser process to start binding to port
+        3. Wait for the returned port to be open (browser process started)
+        4. Verify the CDP endpoint is responsive (browser ready for automation)
+        5. Return automation info only after readiness is confirmed
         
         Retry logic handles transient failures (timeouts, port not ready).
         Permanent errors (401, 403, 404) fail immediately.
         
+        CRITICAL FIX: Extended timeouts and initial delay to fix port binding race
+        condition on AWS Lightsail 2GB instances where browser startup is slower.
+        
+        Timing configuration:
+        - startup_timeout: 120s (total timeout for entire startup sequence)
+        - initial_delay: 10s (grace period BEFORE first port check - CRITICAL)
+        - port_timeout: 90s (max wait for port to become available)
+        - cdp_timeout: 20s (max wait for CDP endpoint to respond)
+        - retry_cooldown: 8s (pause between retry attempts)
+        - poll_interval: 0.75s (frequency of port availability checks)
+        
         Args:
             profile_id: The ID of the browser profile to start
-            headless: Run in headless mode. If None, defaults to True in production.
+            headless: Run in headless mode. If None, defaults to True (always headless).
             max_retries: Number of retry attempts on transient failures (default: 3)
-            startup_timeout: Max seconds to wait for browser readiness (default: 60)
+            startup_timeout: Max seconds to wait for browser readiness (default: 120)
             
         Returns:
             Automation info dict with port and wsEndpoint, or None on failure
         """
-        # Default to headless in production environments
+        # Default to headless mode (always run headless unless explicitly set to False)
         if headless is None:
-            headless = IS_PRODUCTION
+            headless = True
         
         # Build URL with parameters
         url = f'{self.local_api_url}/browser_profiles/{profile_id}/start?automation=1'
@@ -1410,29 +1433,44 @@ class DolphinAntyClient:
                     continue
                 
                 # =============================================================
-                # STEP 2: Wait for port to be open (browser process started)
+                # STEP 2: Initial grace period for browser process startup
                 # =============================================================
-                port_timeout = min(30, startup_timeout // 2)
+                # CRITICAL FIX: 10s delay to fix port binding race condition on AWS Lightsail
+                # The browser process needs time to start and bind to the port before we check.
+                # Without this delay, we check too early and timeout waiting for a port that
+                # the browser hasn't had time to bind to yet.
+                initial_delay = 10
+                print(f'[WAIT] Allowing browser process {initial_delay}s to initialize (AWS Lightsail fix)...')
+                time.sleep(initial_delay)
+                
+                # =============================================================
+                # STEP 3: Wait for port to be open (browser process started)
+                # =============================================================
+                # Extended timeout for AWS Lightsail 2GB instances with slower I/O
+                port_timeout = 90
+                print(f'[CHECK] Waiting up to {port_timeout}s for port {port}...')
                 if not self._wait_for_port(port, timeout=port_timeout):
-                    last_error = f'Timeout waiting for port {port} to open'
+                    last_error = f'Timeout waiting for port {port} to open after {port_timeout}s'
                     print(f'[WARN] Profile start attempt {attempt + 1}/{max_retries}: {last_error}')
                     # Try to stop the profile before retrying
                     self.stop_profile(profile_id)
                     if attempt < max_retries - 1:
-                        time.sleep(2)
+                        time.sleep(8)  # 8s cooldown between retries for AWS Lightsail
                     continue
                 
                 # =============================================================
-                # STEP 3: Verify CDP endpoint is responsive (browser ready)
+                # STEP 4: Verify CDP endpoint is responsive (browser ready)
                 # =============================================================
-                cdp_timeout = min(10, startup_timeout // 4)
+                # Extended CDP timeout for AWS Lightsail 2GB instances
+                cdp_timeout = 20
+                print(f'[CHECK] Verifying CDP endpoint is responsive (timeout: {cdp_timeout}s)...')
                 if not self._verify_cdp_ready(port, timeout=cdp_timeout):
                     last_error = f'CDP endpoint not responsive on port {port}'
                     print(f'[WARN] Profile start attempt {attempt + 1}/{max_retries}: {last_error}')
                     # Try to stop the profile before retrying
                     self.stop_profile(profile_id)
                     if attempt < max_retries - 1:
-                        time.sleep(2)
+                        time.sleep(8)  # 8s cooldown between retries for AWS Lightsail
                     continue
                 
                 # =============================================================
