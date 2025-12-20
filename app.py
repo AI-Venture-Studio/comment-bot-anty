@@ -1340,6 +1340,74 @@ class DolphinAntyClient:
         
         return False
     
+    def is_profile_running(self, profile_id: int) -> bool:
+        """
+        Check if a browser profile is currently running.
+        
+        Args:
+            profile_id: The ID of the browser profile to check
+            
+        Returns:
+            True if profile is running, False otherwise
+        """
+        try:
+            # Dolphin Anty provides an endpoint to check active profiles
+            response = requests.get(
+                f'{self.local_api_url}/browser_profiles/{profile_id}/active',
+                headers=self.headers,
+                timeout=10
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                # Check if the profile has automation info (means it's running)
+                return data.get('success', False) and data.get('automation') is not None
+            
+            return False
+            
+        except Exception as e:
+            print(f'[WARN] Could not check if profile {profile_id} is running: {e}')
+            return False
+    
+    def ensure_profile_stopped(self, profile_id: int) -> bool:
+        """
+        Ensure a profile is fully stopped before starting it.
+        Checks if running and stops it, then waits for cleanup.
+        
+        Args:
+            profile_id: The ID of the browser profile to stop
+            
+        Returns:
+            True if profile is confirmed stopped, False if stop failed
+        """
+        try:
+            # First check if profile is running
+            if self.is_profile_running(profile_id):
+                print(f'[INFO] Profile {profile_id} is currently running - stopping it first...')
+                self.stop_profile(profile_id)
+                time.sleep(3)  # Wait for cleanup
+                
+                # Verify it stopped
+                if self.is_profile_running(profile_id):
+                    print(f'[WARN] Profile {profile_id} still running after stop request')
+                    # Try force stop one more time
+                    self.stop_profile(profile_id)
+                    time.sleep(2)
+                    return not self.is_profile_running(profile_id)
+                else:
+                    print(f'[OK] Profile {profile_id} stopped successfully')
+                    return True
+            else:
+                print(f'[OK] Profile {profile_id} is not running - ready to start')
+                return True
+                
+        except Exception as e:
+            print(f'[WARN] Error checking/stopping profile {profile_id}: {e}')
+            # Try to stop anyway as a safety measure
+            self.stop_profile(profile_id)
+            time.sleep(2)
+            return True  # Assume it worked
+    
     def start_profile(self, profile_id: int, headless: bool = None, 
                       max_retries: int = 3, startup_timeout: int = 120) -> dict | None:
         """
@@ -1379,10 +1447,19 @@ class DolphinAntyClient:
         if headless is None:
             headless = True
         
-        # Build URL with parameters
-        url = f'{self.local_api_url}/browser_profiles/{profile_id}/start?automation=1'
+        # =============================================================
+        # PRE-START: Ensure profile is stopped before starting
+        # =============================================================
+        # This prevents 500 errors from trying to start an already-running profile
+        print(f'[CHECK] Checking if profile {profile_id} is already running...')
+        if not self.ensure_profile_stopped(profile_id):
+            print(f'[WARN] Could not confirm profile {profile_id} is stopped - proceeding anyway')
+        
+        # Build base URL (port will be auto-assigned by Dolphin Anty)
+        # Adding a random component ensures we get a fresh port allocation each time
+        base_url = f'{self.local_api_url}/browser_profiles/{profile_id}/start?automation=1'
         if headless:
-            url += '&headless=true'
+            base_url += '&headless=true'
         
         last_error = None
         
@@ -1391,6 +1468,10 @@ class DolphinAntyClient:
                 # =============================================================
                 # STEP 1: Call REST API to start the profile
                 # =============================================================
+                # Add cache-busting parameter to ensure fresh port allocation on each attempt
+                url = f'{base_url}&_t={int(time.time() * 1000)}'
+                print(f'[INFO] Attempt {attempt + 1}/{max_retries}: Requesting new browser instance...')
+                
                 response = requests.get(url, headers=self.headers, timeout=30)
                 
                 # Handle permanent errors - fail fast, no retry
@@ -1406,8 +1487,25 @@ class DolphinAntyClient:
                 
                 # Handle non-200 responses as transient errors
                 if response.status_code != 200:
+                    # Try to extract error details from response body
+                    error_details = ''
+                    try:
+                        error_data = response.json()
+                        error_details = error_data.get('error', error_data.get('message', ''))
+                    except:
+                        error_details = response.text[:200] if response.text else ''
+                    
                     last_error = f'REST API returned status {response.status_code}'
                     print(f'[WARN] Profile start attempt {attempt + 1}/{max_retries}: {last_error}')
+                    if error_details:
+                        print(f'[WARN] Dolphin Anty error: {error_details}')
+                    
+                    # On 500 error, profile might be in bad state - try stopping it first
+                    if response.status_code == 500:
+                        print(f'[INFO] Attempting to stop profile {profile_id} before retry (may be stuck)...')
+                        self.stop_profile(profile_id)
+                        time.sleep(3)  # Give it time to fully stop
+                    
                     if attempt < max_retries - 1:
                         time.sleep(2 ** attempt)  # Exponential backoff: 1s, 2s, 4s
                     continue
@@ -1424,6 +1522,7 @@ class DolphinAntyClient:
                 
                 automation_info = data.get('automation', {})
                 port = automation_info.get('port')
+                ws_endpoint = automation_info.get('wsEndpoint', 'N/A')
                 
                 if not port:
                     last_error = 'No port returned in automation info'
@@ -1431,6 +1530,10 @@ class DolphinAntyClient:
                     if attempt < max_retries - 1:
                         time.sleep(2 ** attempt)
                     continue
+                
+                # Log the assigned port for debugging
+                print(f'[OK] Dolphin Anty assigned port {port} for this session')
+                print(f'[INFO] WebSocket endpoint: {ws_endpoint}')
                 
                 # =============================================================
                 # STEP 2: Initial grace period for browser process startup
