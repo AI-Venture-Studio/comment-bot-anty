@@ -1138,6 +1138,12 @@ class DolphinAntyClient:
             'Authorization': f'Bearer {self.token}',
             'Content-Type': 'application/json'
         }
+        # Extract the host from local_api_url for port checking
+        # This is CRITICAL: port checks must target the Dolphin Anty server, not localhost
+        from urllib.parse import urlparse
+        parsed = urlparse(local_url)
+        self.dolphin_host = parsed.hostname or 'localhost'
+        print(f'[CONFIG] Dolphin Anty host for port checks: {self.dolphin_host}')
     
     def login(self, show_progress: bool = True) -> bool:
         """Login to Dolphin Anty with token
@@ -1256,22 +1262,31 @@ class DolphinAntyClient:
             print(f'[ERR] Error finding profile by ID: {e}')
             return None
     
-    def _wait_for_port(self, port: int, host: str = 'localhost', timeout: int = 30) -> bool:
+    def _wait_for_port(self, port: int, host: str = None, timeout: int = 30) -> bool:
         """
         Wait until a port is open and accepting connections.
         
         This is a minimal readiness check to ensure the browser process
         has actually bound to the expected port before we attempt CDP connection.
         
+        IMPORTANT: Uses self.dolphin_host by default to check the remote Dolphin Anty
+        server, not localhost (which would be the Render server).
+        
         Args:
             port: Port number to check
-            host: Hostname (default: localhost)
+            host: Hostname (default: self.dolphin_host - the Dolphin Anty server)
             timeout: Maximum seconds to wait
             
         Returns:
             True if port is open, False if timeout reached
         """
         import socket
+        
+        # Use Dolphin Anty host by default, not localhost
+        if host is None:
+            host = self.dolphin_host
+        
+        print(f'[INFO] Checking port {port} on host {host}')
         
         start_time = time.time()
         # Poll interval optimized for AWS Lightsail 2GB instances
@@ -1305,24 +1320,32 @@ class DolphinAntyClient:
         
         return False
     
-    def _verify_cdp_ready(self, port: int, host: str = 'localhost', timeout: int = 10) -> bool:
+    def _verify_cdp_ready(self, port: int, host: str = None, timeout: int = 10) -> bool:
         """
         Verify that the Chrome DevTools Protocol endpoint is responsive.
         
         Sends a simple HTTP request to the CDP JSON endpoint to confirm
         the browser is ready to accept automation connections.
         
+        IMPORTANT: Uses self.dolphin_host by default to check the remote Dolphin Anty
+        server, not localhost (which would be the Render server).
+        
         Args:
             port: CDP port number
-            host: Hostname (default: localhost)
+            host: Hostname (default: self.dolphin_host - the Dolphin Anty server)
             timeout: Request timeout in seconds
             
         Returns:
             True if CDP endpoint responds, False otherwise
         """
+        # Use Dolphin Anty host by default, not localhost
+        if host is None:
+            host = self.dolphin_host
+            
         try:
             # CDP exposes a JSON endpoint that lists available debugging targets
             cdp_url = f'http://{host}:{port}/json/version'
+            print(f'[INFO] Checking CDP endpoint at {cdp_url}')
             response = requests.get(cdp_url, timeout=timeout)
             
             if response.status_code == 200:
@@ -1543,11 +1566,31 @@ class DolphinAntyClient:
                 # Without this delay, we check too early and timeout waiting for a port that
                 # the browser hasn't had time to bind to yet.
                 initial_delay = 10
-                print(f'[WAIT] Allowing browser process {initial_delay}s to initialize (AWS Lightsail fix)...')
+                print(f'[WAIT] Allowing browser process {initial_delay}s to initialize...')
                 time.sleep(initial_delay)
                 
                 # =============================================================
-                # STEP 3: Wait for port to be open (browser process started)
+                # STEP 3: Check if running remotely (skip port check if browser binds to 127.0.0.1)
+                # =============================================================
+                # When Dolphin Anty runs on a remote Windows server, the browser often binds
+                # to 127.0.0.1 only, making it inaccessible from our Render server.
+                # In this case, we skip the port/CDP checks and trust Dolphin Anty's response.
+                is_remote = self.dolphin_host != 'localhost' and self.dolphin_host != '127.0.0.1'
+                
+                if is_remote:
+                    print(f'[INFO] Remote Dolphin Anty detected ({self.dolphin_host})')
+                    print(f'[INFO] Skipping port check (browser likely binds to 127.0.0.1 on Windows)')
+                    print(f'[INFO] Trusting Dolphin Anty response - port {port} should be ready')
+                    # Give extra time for browser to fully initialize
+                    extra_delay = 5
+                    print(f'[WAIT] Additional {extra_delay}s wait for remote browser stability...')
+                    time.sleep(extra_delay)
+                    # Return immediately, trusting the automation info
+                    print(f'[OK] Profile started successfully (remote mode)')
+                    return automation_info
+                
+                # =============================================================
+                # STEP 4: Wait for port to be open (LOCAL mode only)
                 # =============================================================
                 # Extended timeout for AWS Lightsail 2GB instances with slower I/O
                 port_timeout = 90
@@ -1562,7 +1605,7 @@ class DolphinAntyClient:
                     continue
                 
                 # =============================================================
-                # STEP 4: Verify CDP endpoint is responsive (browser ready)
+                # STEP 5: Verify CDP endpoint is responsive (LOCAL mode only)
                 # =============================================================
                 # Extended CDP timeout for AWS Lightsail 2GB instances
                 cdp_timeout = 20
