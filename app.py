@@ -89,25 +89,69 @@ swagger = Swagger(app, config=swagger_config, template=swagger_template)
 # ===========================================
 
 class EventStore:
-    """Thread-safe in-memory event storage for current automation session"""
+    """Thread-safe in-memory event storage for current automation session.
+    
+    CHECKPOINT-BASED DESIGN:
+    - Only stores FINAL outcomes (success or failure)
+    - No retries, attempts, or transient states are exposed
+    - Each checkpoint represents a completed decision
+    """
     
     def __init__(self):
         self.events: List[Dict] = []
+        self.checkpoints: List[Dict] = []  # Final outcome checkpoints only
         self.current_progress = 0
         self.status = 'idle'  # idle, running, completed, error
         self.lock = threading.Lock()
         self.latest_sentence = "Waiting to start..."
+        self.abort_signal = False
+        self.comment_count = 0  # Track total successful comments
         
+    def add_checkpoint(self, event_type: str, status: str, message: str,
+                       target: str = None, index: int = None, total: int = None):
+        """
+        Add a FINAL checkpoint event (success or failure only).
+        
+        Args:
+            event_type: 'campaign' | 'target' | 'comment'
+            status: 'success' | 'failure'
+            message: Human-readable outcome message
+            target: Target profile username (optional)
+            index: Current index for counting events (optional)
+            total: Total count for this action type (optional)
+        """
+        with self.lock:
+            checkpoint = {
+                'type': event_type,
+                'status': status,
+                'message': message,
+                'target': target,
+                'index': index,
+                'total': total,
+                'timestamp': datetime.now().isoformat()
+            }
+            
+            self.checkpoints.append(checkpoint)
+            self.latest_sentence = message
+            
+            # Update comment count on successful comment
+            if event_type == 'comment' and status == 'success':
+                self.comment_count += 1
+            
+            # Determine category for legacy compatibility
+            category = 'success' if status == 'success' else 'error'
+            
+            # Print to console for debugging
+            status_icon = '✓' if status == 'success' else '✗'
+            print(f'[CHECKPOINT] {status_icon} [{event_type.upper()}] {message}')
+            
+            return checkpoint
+    
     def add_event(self, sentence: str, category: str, progress: int = None, 
                   significant: bool = True):
         """
-        Add a new event to the store
-        
-        Args:
-            sentence: Human-readable description
-            category: Event type (navigation, action, success, warning, error)
-            progress: Optional progress percentage (0-100)
-            significant: Whether to show in carousel (default True)
+        Legacy event method - used for internal logging only.
+        These events are NOT shown in the UI carousel.
         """
         with self.lock:
             event = {
@@ -115,33 +159,48 @@ class EventStore:
                 'category': category,
                 'progress': progress if progress is not None else self.current_progress,
                 'timestamp': datetime.now().isoformat(),
-                'significant': significant
+                'significant': False  # Force non-significant for legacy events
             }
             
             if progress is not None:
                 self.current_progress = min(100, max(0, progress))
             
             self.events.append(event)
-            self.latest_sentence = sentence
             
-            # Also print to console for debugging
+            # Print to console for debugging (dimmed)
             print(f'[{category.upper()}] {sentence} ({self.current_progress}%)')
             
             return event
     
-    def get_events(self, significant_only: bool = False, limit: int = None, 
-                   since_timestamp: str = None) -> List[Dict]:
-        """Get events with optional filtering"""
+    def get_checkpoints(self, limit: int = None) -> List[Dict]:
+        """Get checkpoint events for UI carousel (final outcomes only)"""
         with self.lock:
-            events = self.events.copy()
-            
-            if significant_only:
-                events = [e for e in events if e['significant']]
-            
-            if since_timestamp:
-                events = [e for e in events if e['timestamp'] > since_timestamp]
+            checkpoints = self.checkpoints.copy()
             
             # Most recent first for carousel
+            checkpoints.reverse()
+            
+            if limit:
+                checkpoints = checkpoints[:limit]
+            
+            return checkpoints
+    
+    def get_events(self, significant_only: bool = False, limit: int = None, 
+                   since_timestamp: str = None) -> List[Dict]:
+        """Get legacy events - for backward compatibility only"""
+        with self.lock:
+            # Return checkpoints as legacy events for backward compatibility
+            events = []
+            for cp in self.checkpoints:
+                events.append({
+                    'sentence': cp['message'],
+                    'category': 'success' if cp['status'] == 'success' else 'error',
+                    'progress': self.current_progress,
+                    'timestamp': cp['timestamp'],
+                    'significant': True
+                })
+            
+            # Most recent first
             events.reverse()
             
             if limit:
@@ -156,7 +215,8 @@ class EventStore:
                 'status': self.status,
                 'progress': self.current_progress,
                 'latest_sentence': self.latest_sentence,
-                'total_events': len(self.events)
+                'total_events': len(self.checkpoints),
+                'comment_count': self.comment_count
             }
     
     def set_status(self, status: str):
@@ -164,24 +224,49 @@ class EventStore:
         with self.lock:
             self.status = status
     
+    def set_progress(self, progress: int):
+        """Update progress percentage"""
+        with self.lock:
+            self.current_progress = min(100, max(0, progress))
+    
+    def set_abort(self):
+        """Signal to abort the current automation"""
+        with self.lock:
+            self.abort_signal = True
+    
+    def is_aborted(self) -> bool:
+        """Check if abort was requested"""
+        with self.lock:
+            return self.abort_signal
+    
     def clear(self):
         """Clear all events (new session)"""
         with self.lock:
             self.events.clear()
+            self.checkpoints.clear()
             self.current_progress = 0
             self.status = 'idle'
             self.latest_sentence = "Waiting to start..."
+            self.abort_signal = False
+            self.comment_count = 0
 
 # Global event store instance
 event_store = EventStore()
 
 
 # ===========================================
-# PROGRESS EMITTER (EMBEDDED)
+# PROGRESS EMITTER (CHECKPOINT-BASED)
 # ===========================================
 
 class ProgressEmitter:
-    """Singleton class to emit progress events during automation"""
+    """
+    Singleton class to emit progress checkpoints during automation.
+    
+    CHECKPOINT-BASED DESIGN:
+    - Only emits FINAL outcomes (success or failure)
+    - Retries and internal steps are hidden from UI
+    - Each method represents a completed action
+    """
     
     _instance = None
     
@@ -190,77 +275,237 @@ class ProgressEmitter:
             cls._instance = super().__new__(cls)
         return cls._instance
     
-    def emit(self, sentence: str, category: str = 'action', 
-             progress: Optional[int] = None, significant: bool = True):
-        """Emit a progress event"""
-        event_store.add_event(sentence, category, progress, significant)
+    # =========================================
+    # INTERNAL LOGGING (not shown in UI)
+    # =========================================
     
-    # Convenience methods
-    def navigation(self, message: str, progress: Optional[int] = None):
-        self.emit(message, 'navigation', progress, significant=True)
+    def _log(self, message: str, category: str = 'action'):
+        """Internal logging - NOT shown in carousel"""
+        event_store.add_event(message, category, significant=False)
     
-    def action(self, message: str, progress: Optional[int] = None, significant: bool = True):
-        self.emit(message, 'action', progress, significant)
+    # =========================================
+    # CAMPAIGN CHECKPOINTS
+    # =========================================
     
-    def success(self, message: str, progress: Optional[int] = None):
-        self.emit(message, 'success', progress, significant=True)
+    def campaign_starting(self):
+        """Checkpoint: Campaign is starting"""
+        event_store.add_checkpoint(
+            event_type='campaign',
+            status='success',
+            message='Starting campaign'
+        )
     
-    def warning(self, message: str, progress: Optional[int] = None):
-        self.emit(message, 'warning', progress, significant=True)
+    def campaign_completed(self):
+        """Checkpoint: Campaign completed successfully"""
+        event_store.set_progress(100)
+        event_store.add_checkpoint(
+            event_type='campaign',
+            status='success',
+            message='Campaign completed successfully'
+        )
     
-    def error(self, message: str, progress: Optional[int] = None):
-        self.emit(message, 'error', progress, significant=True)
+    def campaign_failed(self, reason: str = None):
+        """Checkpoint: Campaign failed"""
+        message = f'Campaign failed: {reason}' if reason else 'Campaign failed'
+        event_store.add_checkpoint(
+            event_type='campaign',
+            status='failure',
+            message=message
+        )
     
-    def info(self, message: str, progress: Optional[int] = None, significant: bool = False):
-        self.emit(message, 'action', progress, significant)
+    def campaign_aborted(self):
+        """Checkpoint: Campaign was aborted by user"""
+        event_store.add_checkpoint(
+            event_type='campaign',
+            status='failure',
+            message='Campaign aborted by user'
+        )
     
-    # Specific automation events
-    def campaign_started(self, campaign_id: str, index: int, total: int):
-        progress = int((index - 1) / total * 100)
-        self.emit(f'Starting campaign {index} of {total}', 'action', progress)
-    
-    def campaign_completed(self, campaign_id: str, index: int, total: int):
-        progress = int(index / total * 100)
-        self.emit(f'Campaign {index} of {total} completed', 'success', progress)
-    
-    def browser_launching(self):
-        self.emit('Launching anti-detect browser profile', 'action')
-    
-    def browser_connected(self):
-        self.emit('Connected to browser successfully', 'success')
-    
-    def logging_in(self, username: str):
-        self.emit(f'Logging in as @{username}', 'action')
+    # =========================================
+    # LOGIN CHECKPOINTS
+    # =========================================
     
     def login_success(self, username: str):
-        self.emit(f'Successfully logged in as @{username}', 'success')
+        """Checkpoint: Login successful"""
+        event_store.add_checkpoint(
+            event_type='campaign',
+            status='success',
+            message=f'Login successful (@{username})'
+        )
+    
+    def login_failed(self, username: str, reason: str = None):
+        """Checkpoint: Login failed"""
+        message = f'Login failed (@{username})'
+        if reason:
+            message += f': {reason}'
+        event_store.add_checkpoint(
+            event_type='campaign',
+            status='failure',
+            message=message
+        )
+    
+    # =========================================
+    # TARGET PROFILE CHECKPOINTS
+    # =========================================
+    
+    def target_opened(self, target_user: str):
+        """Checkpoint: Target profile opened successfully"""
+        event_store.add_checkpoint(
+            event_type='target',
+            status='success',
+            message=f'Target profile opened (@{target_user})',
+            target=target_user
+        )
+    
+    def target_failed(self, target_user: str, reason: str = None):
+        """Checkpoint: Failed to open target profile"""
+        message = f'Failed to open profile (@{target_user})'
+        if reason:
+            message += f': {reason}'
+        event_store.add_checkpoint(
+            event_type='target',
+            status='failure',
+            message=message,
+            target=target_user
+        )
+    
+    def posts_scanned(self, target_user: str, count: int):
+        """Checkpoint: Posts scanned successfully"""
+        event_store.add_checkpoint(
+            event_type='target',
+            status='success',
+            message=f'Posts scanned ({count} found) @{target_user}',
+            target=target_user,
+            total=count
+        )
+    
+    def posts_scan_failed(self, target_user: str, reason: str = None):
+        """Checkpoint: Failed to scan posts"""
+        message = f'Failed to scan posts (@{target_user})'
+        if reason:
+            message += f': {reason}'
+        event_store.add_checkpoint(
+            event_type='target',
+            status='failure',
+            message=message,
+            target=target_user
+        )
+    
+    def target_completed(self, target_user: str, comments_posted: int):
+        """Checkpoint: Finished processing target profile"""
+        event_store.add_checkpoint(
+            event_type='target',
+            status='success',
+            message=f'Finished @{target_user} ({comments_posted} comments)',
+            target=target_user,
+            total=comments_posted
+        )
+    
+    def target_profile_failed(self, target_user: str, reason: str = None):
+        """Checkpoint: Target profile processing failed"""
+        message = f'Target profile failed (@{target_user})'
+        if reason:
+            message += f': {reason}'
+        event_store.add_checkpoint(
+            event_type='target',
+            status='failure',
+            message=message,
+            target=target_user
+        )
+    
+    # =========================================
+    # COMMENT CHECKPOINTS
+    # =========================================
+    
+    def comment_posted(self, target_user: str, index: int, total: int):
+        """Checkpoint: Comment posted successfully"""
+        event_store.add_checkpoint(
+            event_type='comment',
+            status='success',
+            message=f'Comment posted ({index}/{total}) @{target_user}',
+            target=target_user,
+            index=index,
+            total=total
+        )
+    
+    def comment_failed(self, target_user: str, index: int, total: int, reason: str = None):
+        """Checkpoint: Comment failed"""
+        message = f'Comment failed ({index}/{total}) @{target_user}'
+        if reason:
+            message += f': {reason}'
+        event_store.add_checkpoint(
+            event_type='comment',
+            status='failure',
+            message=message,
+            target=target_user,
+            index=index,
+            total=total
+        )
+    
+    # =========================================
+    # LEGACY METHODS (for internal logging only)
+    # These do NOT show in the UI carousel
+    # =========================================
+    
+    def navigation(self, message: str, progress: Optional[int] = None):
+        self._log(message, 'navigation')
+    
+    def action(self, message: str, progress: Optional[int] = None, significant: bool = False):
+        self._log(message, 'action')
+    
+    def success(self, message: str, progress: Optional[int] = None):
+        self._log(message, 'success')
+    
+    def warning(self, message: str, progress: Optional[int] = None):
+        self._log(message, 'warning')
+    
+    def error(self, message: str, progress: Optional[int] = None):
+        self._log(message, 'error')
+    
+    def info(self, message: str, progress: Optional[int] = None, significant: bool = False):
+        self._log(message, 'action')
+    
+    # Legacy specific events - now just log internally
+    def campaign_started(self, campaign_id: str, index: int, total: int):
+        self._log(f'Processing campaign {index} of {total}', 'action')
+    
+    def browser_launching(self):
+        self._log('Launching browser profile', 'action')
+    
+    def browser_connected(self):
+        self._log('Browser connected', 'action')
+    
+    def logging_in(self, username: str):
+        self._log(f'Attempting login for @{username}', 'action')
     
     def navigating_to_profile(self, target_user: str):
-        self.emit(f"Navigating to @{target_user}'s profile", 'navigation')
+        self._log(f'Navigating to @{target_user}', 'navigation')
     
     def scanning_posts(self, target_user: str):
-        self.emit(f'Scanning posts from @{target_user}', 'action')
+        self._log(f'Scanning posts from @{target_user}', 'action')
     
     def post_found(self, count: int):
-        self.emit(f'Found {count} posts to process', 'action', significant=False)
+        self._log(f'Found {count} posts', 'action')
     
     def commenting_on_post(self, post_num: int, total: int, target_user: str):
-        self.emit(f'Commenting on post {post_num} of {total} from @{target_user}', 'action')
+        self._log(f'Processing post {post_num}/{total}', 'action')
     
     def comment_submitted(self, post_num: int, total: int, comment: str):
-        self.emit(f'Comment submitted on post {post_num}: "{comment}"', 'success')
+        # This is now handled by comment_posted checkpoint
+        self._log(f'Comment submitted on post {post_num}', 'success')
     
     def post_skipped(self, reason: str):
-        self.emit(f'Post skipped: {reason}', 'warning', significant=False)
+        self._log(f'Post skipped: {reason}', 'warning')
     
     def profile_completed(self, target_user: str, commented: int):
-        self.emit(f'Completed @{target_user} ({commented} comments posted)', 'success')
+        # This is now handled by target_completed checkpoint
+        self._log(f'Finished @{target_user}', 'success')
     
     def taking_break(self, duration: int):
-        self.emit(f'Taking a {duration}s break to appear more human', 'action', significant=False)
+        self._log(f'Pausing for {duration}s', 'action')
     
     def cleanup(self):
-        self.emit('Cleaning up browser resources', 'action', significant=False)
+        self._log('Cleaning up resources', 'action')
 
 # Global singleton instance
 progress = ProgressEmitter()
@@ -416,8 +661,37 @@ def get_current_progress():
               type: integer
               example: 42
               description: Total events recorded
+            campaign_info:
+              type: object
+              description: Active campaign metadata (if available)
+              properties:
+                campaign_id:
+                  type: string
+                platform:
+                  type: string
+                user_accounts:
+                  type: array
+                  items:
+                    type: string
+                target_profiles:
+                  type: array
+                  items:
+                    type: string
+                custom_comment:
+                  type: string
     """
     state = event_store.get_current_state()
+    
+    # If EventStore shows idle/completed but there's an active campaign in DB,
+    # fetch and include that campaign's metadata for UI persistence
+    if state['status'] in ['idle', 'completed'] or state['total_events'] == 0:
+        active_campaign = get_active_campaign_from_db()
+        if active_campaign:
+            state['status'] = 'running'
+            state['campaign_info'] = active_campaign
+            if state['latest_sentence'] == 'Waiting to start...':
+                state['latest_sentence'] = f"Campaign {active_campaign.get('campaign_id', 'running')} in progress..."
+    
     return jsonify(state)
 
 
@@ -503,22 +777,106 @@ def get_event_feed():
     })
 
 
+@app.route('/api/progress/checkpoints', methods=['GET'])
+def get_checkpoints():
+    """
+    Get Checkpoint Feed for Carousel
+    ---
+    tags:
+      - Progress
+    summary: Fetch final outcome checkpoints for UI carousel
+    description: |
+      Returns only FINAL outcomes (success or failure) for display in the carousel.
+      No retries, attempts, or transient states are included.
+      Each checkpoint represents a completed decision.
+    parameters:
+      - in: query
+        name: limit
+        type: integer
+        required: false
+        description: Maximum number of checkpoints to return
+        example: 10
+    responses:
+      200:
+        description: Checkpoint feed
+        schema:
+          type: object
+          properties:
+            checkpoints:
+              type: array
+              items:
+                type: object
+                properties:
+                  type:
+                    type: string
+                    enum: [campaign, target, comment]
+                    example: comment
+                  status:
+                    type: string
+                    enum: [success, failure]
+                    example: success
+                  message:
+                    type: string
+                    example: "Comment posted (1/2) @jakepaul"
+                  target:
+                    type: string
+                    example: jakepaul
+                  index:
+                    type: integer
+                    example: 1
+                  total:
+                    type: integer
+                    example: 2
+                  timestamp:
+                    type: string
+                    format: date-time
+            total:
+              type: integer
+              example: 5
+            comment_count:
+              type: integer
+              example: 3
+              description: Total successful comments posted
+            status:
+              type: string
+              example: running
+    """
+    limit = request.args.get('limit', type=int, default=10)
+    
+    checkpoints = event_store.get_checkpoints(limit=limit)
+    state = event_store.get_current_state()
+    
+    return jsonify({
+        'checkpoints': checkpoints,
+        'total': len(checkpoints),
+        'comment_count': state['comment_count'],
+        'status': event_store.status
+    })
+
+
 def run_automation_in_thread():
     """Run automation in background thread"""
     try:
         event_store.clear()
         event_store.set_status('running')
-        progress.emit('Starting automation system', 'action', 0)
+        
+        # Emit campaign starting checkpoint
+        progress.campaign_starting()
         
         # Run the async automation
         asyncio.run(run_automation_with_dolphin_anty())
         
-        event_store.set_status('completed')
-        progress.emit('All campaigns completed successfully', 'success', 100)
+        # Check if aborted
+        if event_store.is_aborted():
+            event_store.set_status('aborted')
+            progress.campaign_aborted()
+        else:
+            event_store.set_status('completed')
+            progress.campaign_completed()
         
     except Exception as e:
         event_store.set_status('error')
-        progress.emit(f'Automation failed: {str(e)}', 'error')
+        progress.campaign_failed(str(e))
 
 
 @app.route('/api/start', methods=['POST'])
@@ -555,6 +913,65 @@ def start_automation():
     return jsonify({
         'status': 'started',
         'message': 'Automation started successfully'
+    })
+
+
+@app.route('/api/abort', methods=['POST'])
+def abort_automation():
+    """
+    Abort Automation
+    ---
+    tags:
+      - Progress
+    summary: Abort the running automation
+    description: Signals the automation to stop gracefully and marks campaigns as aborted
+    parameters:
+      - in: body
+        name: body
+        schema:
+          type: object
+          properties:
+            campaign_id:
+              type: string
+              description: The campaign ID to abort
+    responses:
+      200:
+        description: Abort signal sent successfully
+        schema:
+          type: object
+          properties:
+            status:
+              type: string
+              example: aborting
+            message:
+              type: string
+              example: Abort signal sent
+      400:
+        description: No automation running
+    """
+    if event_store.status != 'running':
+        return jsonify({
+            'status': 'not_running',
+            'message': 'No automation is currently running'
+        }), 400
+    
+    # Get campaign_id from request
+    data = request.get_json() or {}
+    campaign_id = data.get('campaign_id')
+    
+    # Set abort signal
+    event_store.set_abort()
+    
+    if campaign_id:
+        progress.warning(f'Abort requested for campaign {campaign_id} - stopping gracefully')
+        print(f'\n[ABORT] User requested abort for campaign: {campaign_id}')
+    else:
+        progress.warning('Abort requested - stopping automation gracefully')
+        print('\n[ABORT] User requested abort')
+    
+    return jsonify({
+        'status': 'aborting',
+        'message': 'Abort signal sent - resources will be cleaned up'
     })
 
 
@@ -863,11 +1280,30 @@ async def do_review_pause(logger=None):
     await asyncio.sleep(pause)
 
 
-async def do_post_to_post_delay(logger=None):
+async def do_post_to_post_delay(base_delay: float = None, logger=None):
     """
-    Natural delay between processing posts.
+    Natural delay between processing posts with Gaussian jitter.
+    
+    Args:
+        base_delay: User-configured base delay (seconds). If None, uses default.
+        logger: Optional logger instance
     """
-    delay = get_random_delay(POST_TO_POST_DELAY_MIN, POST_TO_POST_DELAY_MAX)
+    if base_delay is None:
+        base_delay = POST_TO_POST_DELAY_DEFAULT
+    
+    # Clamp base_delay to allowed range
+    base_delay = max(POST_TO_POST_DELAY_MIN, min(POST_TO_POST_DELAY_MAX, base_delay))
+    
+    # Apply ±20% Gaussian jitter
+    jitter_range = base_delay * 0.2
+    min_delay = base_delay - jitter_range
+    max_delay = base_delay + jitter_range
+    
+    # Ensure we stay within absolute bounds
+    min_delay = max(POST_TO_POST_DELAY_MIN, min_delay)
+    max_delay = min(POST_TO_POST_DELAY_MAX, max_delay)
+    
+    delay = get_random_delay(min_delay, max_delay)
     progress.info('Moving to next post', significant=False)
     await asyncio.sleep(delay)
 
@@ -949,47 +1385,49 @@ RETRY_DELAY = 5  # seconds
 CONSECUTIVE_OLD_POSTS_LIMIT = 4
 
 # ===========================================
-# HUMAN-LIKE BEHAVIOR SETTINGS
+# HUMAN-LIKE BEHAVIOR SETTINGS (LOCKED)
 # ===========================================
+# These constants are locked for safety and cannot be changed by users
 
 # Typing delays (milliseconds) - realistic human typing speed
-IG_TYPING_DELAY_MIN = 140  # minimum delay between keystrokes
-IG_TYPING_DELAY_MAX = 300  # maximum delay between keystrokes
+IG_TYPING_DELAY_MIN = 220  # minimum delay between keystrokes (LOCKED)
+IG_TYPING_DELAY_MAX = 320  # maximum delay between keystrokes (LOCKED)
 
 # Word and punctuation pauses (seconds)
-WORD_PAUSE_MIN = 0.25  # pause between words
-WORD_PAUSE_MAX = 0.8
-PUNCTUATION_PAUSE_MIN = 0.5  # pause after punctuation/sentences
-PUNCTUATION_PAUSE_MAX = 1.5
+WORD_PAUSE_MIN = 0.4  # pause between words (LOCKED)
+WORD_PAUSE_MAX = 1.2  # (LOCKED)
+PUNCTUATION_PAUSE_MIN = 0.8  # pause after punctuation/sentences (LOCKED)
+PUNCTUATION_PAUSE_MAX = 2.5  # (LOCKED)
 
 # Pre-typing and post-typing pauses (seconds)
-PRE_TYPING_HESITATION_MIN = 0.4  # hesitation before starting to type
-PRE_TYPING_HESITATION_MAX = 0.9
-REVIEW_PAUSE_MIN = 1.0  # pause after typing to "review" before posting
-REVIEW_PAUSE_MAX = 3.0
+PRE_TYPING_HESITATION_MIN = 0.8  # hesitation before starting to type (LOCKED)
+PRE_TYPING_HESITATION_MAX = 2.0  # (LOCKED)
+REVIEW_PAUSE_MIN = 2.5  # pause after typing to "review" before posting (LOCKED)
+REVIEW_PAUSE_MAX = 6.0  # (LOCKED)
 
 # Typo simulation
-TYPO_CHANCE = 0.07  # 7% chance of making a typo per word
-TYPO_CORRECTION_DELAY_MIN = 0.3  # delay before noticing and correcting typo
-TYPO_CORRECTION_DELAY_MAX = 0.8
+TYPO_CHANCE = 0.07  # 7% chance of making a typo per word (LOCKED)
+TYPO_CORRECTION_DELAY_MIN = 0.3  # delay before noticing and correcting typo (LOCKED)
+TYPO_CORRECTION_DELAY_MAX = 0.8  # (LOCKED)
 
-# Action delays (seconds)
-POST_TO_POST_DELAY_MIN = 3  # delay between processing posts
-POST_TO_POST_DELAY_MAX = 7
-PROFILE_TO_PROFILE_DELAY_MIN = 10  # delay between profiles
-PROFILE_TO_PROFILE_DELAY_MAX = 25
-LONG_PAUSE_MIN = 30  # occasional long break
-LONG_PAUSE_MAX = 60
-LONG_PAUSE_FREQUENCY = 7  # long pause every N profiles (5-10 range)
+# Action delays (seconds) - LOCKED except post-to-post which is user-configurable
+POST_TO_POST_DELAY_MIN = 8  # User-configurable range minimum (LOCKED)
+POST_TO_POST_DELAY_MAX = 20  # User-configurable range maximum (LOCKED)
+POST_TO_POST_DELAY_DEFAULT = 15  # Default value if not specified by user
+PROFILE_TO_PROFILE_DELAY_MIN = 25  # delay between profiles (LOCKED)
+PROFILE_TO_PROFILE_DELAY_MAX = 60  # (LOCKED)
+LONG_PAUSE_MIN = 180  # occasional long break: 3 minutes (LOCKED)
+LONG_PAUSE_MAX = 300  # 5 minutes (LOCKED)
+LONG_PAUSE_FREQUENCY = 6  # long pause every 6 profiles (LOCKED)
 
 # Mouse movement settings
-MOUSE_OVERSHOOT_CHANCE = 0.3  # 30% chance of overshooting target
-MOUSE_MOVEMENT_STEPS_MIN = 8  # minimum steps for curved movement
-MOUSE_MOVEMENT_STEPS_MAX = 20  # maximum steps for curved movement
-MOUSE_STEP_DELAY_MIN = 0.01  # delay between movement steps (seconds)
-MOUSE_STEP_DELAY_MAX = 0.03
-MOUSE_PRE_CLICK_PAUSE_MIN = 0.1  # pause before clicking
-MOUSE_PRE_CLICK_PAUSE_MAX = 0.4
+MOUSE_OVERSHOOT_CHANCE = 0.3  # 30% chance of overshooting target (LOCKED)
+MOUSE_MOVEMENT_STEPS_MIN = 12  # minimum steps for curved movement (LOCKED)
+MOUSE_MOVEMENT_STEPS_MAX = 30  # maximum steps for curved movement (LOCKED)
+MOUSE_STEP_DELAY_MIN = 0.6  # delay between movement steps (seconds) (LOCKED)
+MOUSE_STEP_DELAY_MAX = 1.6  # (LOCKED)
+MOUSE_PRE_CLICK_PAUSE_MIN = 0.1  # pause before clicking (LOCKED)
+MOUSE_PRE_CLICK_PAUSE_MAX = 0.4  # (LOCKED)
 
 # Comment retry settings
 IG_MAX_COMMENT_RETRIES = 2
@@ -1523,6 +1961,19 @@ class DolphinAntyClient:
                     if error_details:
                         print(f'[WARN] Dolphin Anty error: {error_details}')
                     
+                    # Detect Windows file lock errors - these won't resolve with retries
+                    file_lock_keywords = ['EBUSY', 'resource busy', 'locked', 'UNKNOWN: unknown error, open']
+                    is_file_lock_error = any(keyword in error_details for keyword in file_lock_keywords)
+                    
+                    if is_file_lock_error:
+                        print(f'[ERR] Windows file lock detected on profile {profile_id}!')
+                        print(f'[ERR] The browser profile has corrupted/locked files from a previous crash.')
+                        print(f'[ERR] FIX: Run this on Windows server:')
+                        print(f'[ERR]   Remove-Item -Recurse -Force "C:\\Users\\Administrator\\AppData\\Roaming\\dolphin_anty\\browser_profiles\\{profile_id}\\data_dir\\Default"')
+                        print(f'[ERR] Or assign a different browser profile to this account.')
+                        # Don't retry - file locks won't clear with simple retries
+                        return None
+                    
                     # On 500 error, profile might be in bad state - try stopping it first
                     if response.status_code == 500:
                         print(f'[INFO] Attempting to stop profile {profile_id} before retry (may be stuck)...')
@@ -1733,7 +2184,12 @@ async def detect_bot_challenge(page: Page) -> bool:
             "We need to confirm that you're human",
             "Complete the security check",
             "Suspicious activity",
-            "Unusual activity"
+            "Unusual activity",
+            "Enter your mobile number",
+            "You'll need to confirm this mobile number",
+            "confirm this mobile number with a code",
+            "Phone number verification",
+            "Add a phone number"
         ]
         
         for phrase in bot_challenge_phrases:
@@ -1821,6 +2277,11 @@ async def perform_instagram_login(page: Page, username: str, password: str):
     # Navigate to Instagram login page with retry logic
     progress.action('Navigating to login page')
     await navigate_with_retry(page, 'https://www.instagram.com/accounts/login/?hl=en')
+    
+    # Check for bot challenge/verification screen after navigation
+    await asyncio.sleep(2)  # Wait for page to load
+    if await detect_bot_challenge(page):
+        raise Exception('Instagram account suspended - bot challenge or phone verification required')
     
     # Accept cookies if prompted
     try:
@@ -1950,6 +2411,9 @@ async def get_post_links_from_profile(page: Page, target_user: str, logger: Auto
         progress.info(f'Loading profile page for @{target_user}', significant=False)
         await navigate_with_retry(page, f'https://www.instagram.com/{target_user}/?hl=en')
         
+        # Emit target opened checkpoint after successful navigation
+        progress.target_opened(target_user)
+        
         # Wait for posts to load
         await asyncio.sleep(2)
         
@@ -1989,7 +2453,7 @@ async def get_post_links_from_profile(page: Page, target_user: str, logger: Auto
         logger.log_success(f'Found {len(post_links)} posts on @{target_user} profile')
         
     except Exception as e:
-        progress.error(f'Unable to scan profile posts: {str(e)[:50]}')
+        progress.target_failed(target_user, f'Unable to access profile: {str(e)[:50]}')
     
     return post_links
 
@@ -2232,11 +2696,12 @@ async def comment_on_post(page: Page, comment_text: str, logger: AutomationLogge
 
 
 async def process_posts_after_date(
-    page: Page, 
+    page: Page,
     target_user: str, 
-    date_threshold: datetime, 
+    date_threshold: datetime,
     comment_text: str,
-    logger: AutomationLogger
+    logger: AutomationLogger,
+    post_delay: float = None
 ) -> dict:
     """
     Process posts from a user that were posted after the given date.
@@ -2252,6 +2717,7 @@ async def process_posts_after_date(
         date_threshold: Only process posts after this date
         comment_text: Comment to post on each post
         logger: AutomationLogger instance
+        post_delay: User-configured delay between posts (seconds)
         
     Returns:
         Dict with processing results
@@ -2273,16 +2739,23 @@ async def process_posts_after_date(
     result["posts_found"] = len(post_links)
     
     if not post_links:
-        progress.warning('No posts found on this profile')
+        progress.posts_scan_failed(target_user, "No posts found")
         return result
     
-    progress.post_found(len(post_links))
+    # Emit posts scanned checkpoint
+    progress.posts_scanned(target_user, len(post_links))
     
     # Track consecutive old posts for early termination
     consecutive_old_posts = 0
     
     # Process each post (newest to oldest)
     for i, post_url in enumerate(post_links):
+        # Check for abort signal
+        if event_store.is_aborted():
+            progress.warning('Post processing aborted by user')
+            result["stopped_early"] = True
+            break
+        
         progress.info(f'Analyzing post {i + 1} of {len(post_links)}', significant=False)
         
         try:
@@ -2320,13 +2793,15 @@ async def process_posts_after_date(
             commented = await comment_on_post(page, comment_text, logger)
             if commented:
                 result["posts_commented"] += 1
-                progress.comment_submitted(i + 1, len(post_links), comment_text)
+                progress.comment_posted(target_user, result["posts_commented"], len(post_links))
+            else:
+                progress.comment_failed(target_user, i + 1, len(post_links), "Could not submit comment")
             
             logger.log_post_processed(commented=commented)
             result["posts_processed"] += 1
             
-            # Human-like delay between posts (3-7 seconds)
-            await do_post_to_post_delay(logger)
+            # Human-like delay between posts with user-configured base delay
+            await do_post_to_post_delay(post_delay, logger)
             
         except Exception as e:
             error_msg = f'Error processing post {post_url}: {e}'
@@ -2342,7 +2817,8 @@ async def process_posts_by_count(
     target_user: str, 
     post_count: int,
     comment_text: str,
-    logger: AutomationLogger
+    logger: AutomationLogger,
+    post_delay: float = None
 ) -> dict:
     """
     Process a fixed number of posts from a user (newest first).
@@ -2354,6 +2830,7 @@ async def process_posts_by_count(
         post_count: Number of posts to process
         comment_text: Comment to post on each post
         logger: AutomationLogger instance
+        post_delay: User-configured delay between posts (seconds)
         
     Returns:
         Dict with processing results
@@ -2375,17 +2852,23 @@ async def process_posts_by_count(
     result["posts_found"] = len(post_links)
     
     if not post_links:
-        progress.warning('No posts found on this profile')
+        progress.posts_scan_failed(target_user, "No posts found")
         return result
     
     # Limit to the specified number of posts
     posts_to_process = post_links[:post_count]
-    progress.info(f'Processing {len(posts_to_process)} most recent posts', significant=False)
     
-    progress.post_found(len(posts_to_process))
+    # Emit posts scanned checkpoint
+    progress.posts_scanned(target_user, len(posts_to_process))
     
     # Process each post
     for i, post_url in enumerate(posts_to_process):
+        # Check for abort signal
+        if event_store.is_aborted():
+            progress.warning('Post processing aborted by user')
+            result["stopped_early"] = True
+            break
+        
         progress.info(f'Analyzing post {i + 1} of {len(posts_to_process)}', significant=False)
         
         try:
@@ -2402,13 +2885,15 @@ async def process_posts_by_count(
             commented = await comment_on_post(page, comment_text, logger)
             if commented:
                 result["posts_commented"] += 1
-                progress.comment_submitted(i + 1, len(posts_to_process), comment_text)
+                progress.comment_posted(target_user, result["posts_commented"], len(posts_to_process))
+            else:
+                progress.comment_failed(target_user, i + 1, len(posts_to_process), "Could not submit comment")
             
             logger.log_post_processed(commented=commented)
             result["posts_processed"] += 1
             
-            # Human-like delay between posts (3-7 seconds)
-            await do_post_to_post_delay(logger)
+            # Human-like delay between posts with user-configured base delay
+            await do_post_to_post_delay(post_delay, logger)
             
         except Exception as e:
             error_msg = f'Error processing post {post_url}: {e}'
@@ -2522,7 +3007,7 @@ def update_campaign_status(campaign_id: str, status: str):
     
     Args:
         campaign_id: Campaign identifier
-        status: New status ('not-started', 'in-progress', 'completed', 'failed')
+        status: New status ('not-started', 'in-progress', 'completed', 'failed', 'aborted')
     """
     try:
         supabase = get_supabase_client()
@@ -2533,6 +3018,55 @@ def update_campaign_status(campaign_id: str, status: str):
         print(f'[DB] Updated campaign {campaign_id} status to: {status}')
     except Exception as e:
         print(f'[ERR] Could not update campaign status: {e}')
+
+
+def get_active_campaign_from_db():
+    """
+    Retrieve currently active (in-progress) campaign from database.
+    Used to restore progress UI state after page refresh.
+    
+    Returns:
+        Dict with campaign data or None if no active campaign
+    """
+    try:
+        supabase = get_supabase_client()
+        response = supabase.table('comment_campaigns').select(
+            'campaign_id,platform,user_accounts,target_profiles,custom_comment,status,created_at'
+        ).eq('status', 'in-progress').limit(1).execute()
+        
+        if response.data and len(response.data) > 0:
+            campaign = response.data[0]
+            return {
+                'campaign_id': campaign.get('campaign_id'),
+                'platform': campaign.get('platform', 'instagram'),
+                'user_accounts': campaign.get('user_accounts', []),
+                'target_profiles': campaign.get('target_profiles', []),
+                'custom_comment': campaign.get('custom_comment', ''),
+                'created_at': campaign.get('created_at')
+            }
+        return None
+    except Exception as e:
+        print(f'[ERR] Could not get active campaign from database: {e}')
+        return None
+
+
+def deactivate_account(username: str, platform: str = 'instagram'):
+    """
+    Deactivate a social account when it's suspended or flagged.
+    
+    Args:
+        username: Account username
+        platform: Social media platform (default: 'instagram')
+    """
+    try:
+        supabase = get_supabase_client()
+        supabase.table('social_accounts').update({
+            'is_active': False,
+            'updated_at': datetime.now().isoformat()
+        }).eq('username', username).eq('platform', platform).execute()
+        print(f'[DB] Deactivated account @{username} on {platform}')
+    except Exception as e:
+        print(f'[ERR] Could not deactivate account @{username}: {e}')
 
 
 def get_account_credentials(username: str, platform: str = 'instagram'):
@@ -2558,6 +3092,35 @@ def get_account_credentials(username: str, platform: str = 'instagram'):
     except Exception as e:
         print(f'[ERR] Could not get account credentials: {e}')
         return None
+
+
+def validate_accounts_status(usernames: list, platform: str = 'instagram') -> dict:
+    """
+    Validate that all accounts are active before starting campaign.
+    
+    Args:
+        usernames: List of account usernames to validate
+        platform: Social media platform (default: 'instagram')
+        
+    Returns:
+        Dict with 'valid' (bool) and 'inactive_accounts' (list) keys
+    """
+    try:
+        supabase = get_supabase_client()
+        response = supabase.table('social_accounts').select('username,is_active').eq('platform', platform).in_('username', usernames).execute()
+        
+        if not response.data:
+            return {'valid': False, 'inactive_accounts': usernames}
+        
+        inactive_accounts = [acc['username'] for acc in response.data if not acc['is_active']]
+        
+        return {
+            'valid': len(inactive_accounts) == 0,
+            'inactive_accounts': inactive_accounts
+        }
+    except Exception as e:
+        print(f'[ERR] Could not validate accounts status: {e}')
+        return {'valid': False, 'inactive_accounts': []}
 
 
 def get_env_config():
@@ -2730,6 +3293,24 @@ async def run_automation_with_dolphin_anty():
     
     # Process each campaign in queue
     for campaign_idx, campaign in enumerate(campaigns, 1):
+        # Check for abort signal
+        if event_store.is_aborted():
+            print('\n[ABORT] Abort signal detected - stopping campaign processing')
+            progress.warning('Campaign processing aborted by user')
+            
+            # Mark current campaign as aborted if it's in-progress
+            campaign_id = campaign.get("campaign_id")
+            if campaign_id:
+                update_campaign_status(campaign_id, 'aborted')
+            
+            # Mark all remaining campaigns as not-started
+            for remaining_campaign in campaigns[campaign_idx:]:
+                remaining_id = remaining_campaign.get("campaign_id")
+                if remaining_id:
+                    print(f'[ABORT] Resetting campaign {remaining_id} to not-started')
+            
+            break
+        
         campaign_id = campaign.get("campaign_id")
         
         print('\n' + '='*70)
@@ -2767,6 +3348,7 @@ async def run_automation_with_dolphin_anty():
         print(f'    - Account credentials found')
         print(f'    - Anti-detect browser connected')
         print(f'    - Browser profiles available')
+        print(f'    - Note: Account suspension status will be verified during execution')
         
         # ====================================================================
         # STEP 2: CHANGE STATUS TO 'in-progress' (checks passed)
@@ -2780,9 +3362,15 @@ async def run_automation_with_dolphin_anty():
         target_users = campaign.get('target_profiles', [])
         comment_text = campaign.get('custom_comment', 'Great post!')
         
+        # Backwards compatibility: default to 15 seconds if post_delay is not set or is None
+        post_delay = campaign.get('post_delay')
+        if post_delay is None:
+            post_delay = POST_TO_POST_DELAY_DEFAULT
+        
         print(f'\n[INFO] Campaign will run using {len(user_accounts)} account(s):')
         for idx, acc in enumerate(user_accounts, 1):
             print(f'    {idx}. @{acc}')
+        print(f'[CONFIG] Time between comments: {post_delay}s (with ±20% randomization)')
         
         # Determine mode (count vs date)
         number_of_posts = campaign.get('number_of_posts')
@@ -2807,9 +3395,31 @@ async def run_automation_with_dolphin_anty():
         all_accounts_successful = True
         
         for account_idx, account_username in enumerate(user_accounts, 1):
+            # Check for abort signal before processing each account
+            if event_store.is_aborted():
+                print(f'\n[ABORT] Abort signal detected - skipping account @{account_username}')
+                progress.warning(f'Skipping remaining accounts due to abort')
+                all_accounts_successful = False
+                break
+            
             print('\n' + '='*70)
             print(f'[ACCOUNT] {account_idx}/{len(user_accounts)}: @{account_username}')
             print('='*70)
+            
+            # Check if account is still active before processing
+            print(f'[CHECK] Verifying account @{account_username} is active...')
+            account_validation = validate_accounts_status([account_username], platform)
+            
+            if not account_validation['valid']:
+                print(f'[ERR] Account @{account_username} is suspended or inactive')
+                progress.error(f'Campaign failed: Account @{account_username} is suspended')
+                
+                # Mark campaign as failed and stop
+                update_campaign_status(campaign_id, 'failed')
+                all_accounts_successful = False
+                break
+            
+            print(f'[OK] Account @{account_username} is active')
             
             # Get credentials for this account
             credentials = get_account_credentials(account_username, platform)
@@ -2892,7 +3502,7 @@ async def run_automation_with_dolphin_anty():
                 print(f"\n[>>] Starting profile: {profile.get('name')} (ID: {profile_id})")
                 
                 progress.browser_launching()
-                automation_info = dolphin.start_profile(profile_id)
+                automation_info = dolphin.start_profile(profile_id, headless=False)
                 if not automation_info:
                     raise Exception("Failed to start Dolphin Anty profile")
                 
@@ -2946,13 +3556,17 @@ async def run_automation_with_dolphin_anty():
                 
                 first_target = target_users[0]
                 progress.logging_in(instagram_username)
-                await instagram_login(
-                    page=page,
-                    username=instagram_username,
-                    password=instagram_password,
-                    target_user=first_target
-                )
-                progress.login_success(instagram_username)
+                try:
+                    await instagram_login(
+                        page=page,
+                        username=instagram_username,
+                        password=instagram_password,
+                        target_user=first_target
+                    )
+                    progress.login_success(instagram_username)
+                except Exception as login_error:
+                    progress.login_failed(instagram_username, str(login_error)[:100])
+                    raise  # Re-raise to be caught by outer exception handler
                 
                 print('\n' + '='*50)
                 print('[OK] LOGIN PHASE COMPLETED!')
@@ -2962,6 +3576,12 @@ async def run_automation_with_dolphin_anty():
                 all_results = []
                 
                 for idx, target_user in enumerate(target_users, 1):
+                    # Check for abort signal before processing each target
+                    if event_store.is_aborted():
+                        print('\n[ABORT] Abort signal detected - stopping target processing')
+                        progress.warning('Skipping remaining targets due to abort')
+                        break
+                    
                     print('\n' + '='*50)
                     print(f'[PROFILE] PROCESSING TARGET {idx}/{len(target_users)}: @{target_user}')
                     print('='*50)
@@ -2975,7 +3595,8 @@ async def run_automation_with_dolphin_anty():
                             target_user=target_user,
                             post_count=post_count,
                             comment_text=comment_text,
-                            logger=user_logger
+                            logger=user_logger,
+                            post_delay=post_delay
                         )
                     else:
                         post_result = await process_posts_after_date(
@@ -2983,12 +3604,16 @@ async def run_automation_with_dolphin_anty():
                             target_user=target_user,
                             date_threshold=date_threshold,
                             comment_text=comment_text,
-                            logger=user_logger
+                            logger=user_logger,
+                            post_delay=post_delay
                         )
                     
                     print(f'\n[OK] COMPLETED @{target_user}')
                     user_logger.print_summary(stopped_early=post_result.get("stopped_early", False))
-                    progress.profile_completed(target_user, post_result.get('posts_commented', 0))
+                    
+                    # Emit target completed checkpoint
+                    comments_posted = post_result.get('posts_commented', 0)
+                    progress.target_completed(target_user, comments_posted)
                     
                     all_results.append({
                         "target_user": target_user,
@@ -3023,11 +3648,26 @@ async def run_automation_with_dolphin_anty():
             except Exception as e:
                 print(f'\n[ERR] Account automation error for @{instagram_username}: {e}')
                 
-                # Check if it's a bot challenge error
-                error_msg = str(e)
-                if 'bot challenge' in error_msg.lower() or 'human verification' in error_msg.lower():
-                    print(f'[ERR] Instagram bot challenge detected - marking campaign as failed')
-                    progress.error(f'Instagram requires human verification for @{instagram_username}')
+                # Check if it's an abort signal
+                if event_store.is_aborted():
+                    print(f'[ABORT] Abort detected during error handling')
+                    progress.warning(f'Campaign aborted - cleaning up @{instagram_username}')
+                    account_success = False
+                    all_accounts_successful = False
+                    # Break out of account loop - abort requested
+                    break
+                # Check if it's a suspension/bot challenge error
+                elif ('bot challenge' in str(e).lower() or 
+                      'human verification' in str(e).lower() or 
+                      'account suspended' in str(e).lower() or
+                      'phone verification' in str(e).lower()):
+                    print(f'[ERR] Instagram account suspended - account @{instagram_username} is flagged')
+                    progress.error(f'Campaign failed: Account @{instagram_username} is suspended')
+                    
+                    # Deactivate the suspended account
+                    deactivate_account(instagram_username, platform)
+                    
+                    # Mark campaign as failed
                     update_campaign_status(campaign_id, 'failed')
                     all_accounts_successful = False
                     # Break out of account loop - no point trying other accounts
@@ -3056,6 +3696,11 @@ async def run_automation_with_dolphin_anty():
                 except Exception as e:
                     print(f'[WARN] Could not stop profile: {e}')
                 
+                # Check for abort before proceeding to next account
+                if event_store.is_aborted():
+                    print(f'\n[ABORT] Abort signal detected - skipping remaining accounts')
+                    break
+                
                 # Delay before next account (if not the last one)
                 if account_idx < len(user_accounts):
                     delay_time = random.uniform(10, 20)
@@ -3065,7 +3710,17 @@ async def run_automation_with_dolphin_anty():
         # Update campaign status based on overall success
         campaign_success = all_accounts_successful
         
-        if campaign_success:
+        # Check if campaign was aborted
+        if event_store.is_aborted():
+            print(f'\n[ABORT] Campaign {campaign_id} was aborted by user')
+            campaign_results.append({
+                'campaign_id': campaign_id,
+                'status': 'aborted'
+            })
+            print(f'\n[STATUS] Updating campaign status to: aborted')
+            update_campaign_status(campaign_id, 'aborted')
+            progress.warning(f'Campaign {campaign_id} aborted')
+        elif campaign_success:
             print(f'\n[OK] All {len(user_accounts)} account(s) completed successfully')
             campaign_results.append({
                 'campaign_id': campaign_id,
@@ -3074,7 +3729,7 @@ async def run_automation_with_dolphin_anty():
             # Update to completed
             print(f'\n[STATUS] Updating campaign status to: completed')
             update_campaign_status(campaign_id, 'completed')
-            progress.campaign_completed(campaign_id, campaign_idx, len(campaigns))
+            progress.campaign_completed()
         else:
             print(f'\n[WARN] Some accounts failed or encountered errors')
             # Check if already marked as failed (bot challenge)
@@ -3111,10 +3766,12 @@ async def run_automation_with_dolphin_anty():
     completed = sum(1 for r in campaign_results if r.get('status') == 'completed')
     skipped = sum(1 for r in campaign_results if r.get('status') == 'skipped')
     failed = sum(1 for r in campaign_results if r.get('status') == 'failed')
+    aborted = sum(1 for r in campaign_results if r.get('status') == 'aborted')
     
     print(f'   Completed: {completed}')
     print(f'   Skipped: {skipped}')
     print(f'   Failed: {failed}')
+    print(f'   Aborted: {aborted}')
     print('='*70)
     
     return campaign_results
