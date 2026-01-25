@@ -18,6 +18,8 @@ from supabase import create_client, Client
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from flasgger import Swagger, swag_from
+from twitter import TwitterAutomation, TwitterSelectors, TweetReplyResult, stream_type_text
+from instagram import InstagramAutomation, InstagramSelectors
 
 dotenv.load_dotenv()
 
@@ -26,7 +28,14 @@ dotenv.load_dotenv()
 # ===========================================
 
 # Detect production environment
-IS_PRODUCTION = os.environ.get('RENDER') or os.environ.get('GUNICORN_CMD_ARGS') or 'gunicorn' in os.environ.get('SERVER_SOFTWARE', '')
+# Check for explicit PRODUCTION env var first (recommended for Windows VPS)
+IS_PRODUCTION = (
+    os.environ.get('PRODUCTION', '').lower() in ('true', '1', 'yes') or
+    os.environ.get('RENDER') or 
+    os.environ.get('GUNICORN_CMD_ARGS') or 
+    'gunicorn' in os.environ.get('SERVER_SOFTWARE', '') or
+    os.environ.get('WAITRESS_THREADS')  # For Windows-compatible WSGI server
+)
 
 # Get port from environment (Render provides PORT)
 PORT = int(os.environ.get('PORT', 5001))
@@ -40,11 +49,14 @@ ALLOWED_ORIGINS = os.environ.get('ALLOWED_ORIGINS', '*').split(',')
 
 app = Flask(__name__)
 
-# Configure CORS
-if IS_PRODUCTION and ALLOWED_ORIGINS != ['*']:
-    CORS(app, origins=ALLOWED_ORIGINS)
-else:
-    CORS(app)
+# Configure CORS with proper settings for API
+cors_config = {
+    'origins': ALLOWED_ORIGINS if IS_PRODUCTION and ALLOWED_ORIGINS != ['*'] else '*',
+    'methods': ['GET', 'POST', 'OPTIONS'],
+    'allow_headers': ['Content-Type', 'Authorization'],
+    'supports_credentials': True
+}
+CORS(app, **cors_config)
 
 # Swagger configuration
 swagger_config = {
@@ -65,8 +77,8 @@ swagger_config = {
 swagger_template = {
     "swagger": "2.0",
     "info": {
-        "title": "Instagram Comment Bot API",
-        "description": "Real-time progress streaming API for Instagram automation campaigns",
+        "title": "Social Media Comment Bot API",
+        "description": "Real-time progress streaming API for Instagram and X/Twitter automation campaigns",
         "version": "1.0.0",
         "contact": {
             "name": "API Support"
@@ -515,6 +527,44 @@ progress = ProgressEmitter()
 # FLASK API ENDPOINTS
 # ===========================================
 
+@app.route('/', methods=['GET'])
+def index():
+    """
+    API Root
+    ---
+    tags:
+      - Health
+    summary: API welcome message
+    description: Returns welcome message and available endpoints
+    responses:
+      200:
+        description: Welcome message with API information
+        schema:
+          type: object
+          properties:
+            message:
+              type: string
+              example: Welcome to Social Media Comment Bot API
+            version:
+              type: string
+              example: 1.0.0
+            endpoints:
+              type: object
+              properties:
+                docs:
+                  type: string
+                  example: /api/docs
+                health:
+                  type: string
+                  example: /health
+    """
+    return jsonify({
+        'message': 'Social Media Comment Bot API by AIVS',
+        'version': '2.0.0 - Twitter Support',
+        'status': 'running'
+    })
+
+
 @app.route('/health', methods=['GET'])
 def health_check():
     """
@@ -523,7 +573,7 @@ def health_check():
     tags:
       - Health
     summary: Check API health status
-    description: Returns the health status of the API
+    description: Returns the health status of the API and its dependencies
     responses:
       200:
         description: API is healthy
@@ -535,11 +585,41 @@ def health_check():
               example: healthy
             service:
               type: string
-              example: instagram-comment-bot
+              example: social-media-comment-bot
+            environment:
+              type: string
+              example: production
+            workers_started:
+              type: boolean
+              example: true
     """
+    # Check Dolphin Anty connection
+    dolphin_status = 'unknown'
+    try:
+        dolphin = DolphinAntyClient()
+        dolphin_status = 'connected' if dolphin.login(show_progress=False) else 'disconnected'
+    except:
+        dolphin_status = 'error'
+    
+    # Check Supabase connection
+    supabase_status = 'unknown'
+    try:
+        client = get_supabase_client()
+        supabase_status = 'connected'
+    except:
+        supabase_status = 'error'
+    
     return jsonify({
         'status': 'healthy',
-        'service': 'instagram-comment-bot'
+        'service': 'social-media-comment-bot',
+        'environment': 'production' if IS_PRODUCTION else 'development',
+        'automation_status': event_store.status,
+        'workers_started': _workers_started,
+        'dependencies': {
+            'dolphin_anty': dolphin_status,
+            'supabase': supabase_status
+        },
+        'timestamp': datetime.now().isoformat()
     })
 
 
@@ -887,7 +967,7 @@ def start_automation():
     tags:
       - Progress
     summary: Start the automation process
-    description: Initiates the Instagram comment bot automation in a background thread
+    description: Initiates the social media comment bot automation in a background thread (supports Instagram and X/Twitter)
     responses:
       200:
         description: Automation started successfully
@@ -949,30 +1029,45 @@ def abort_automation():
       400:
         description: No automation running
     """
-    if event_store.status != 'running':
-        return jsonify({
-            'status': 'not_running',
-            'message': 'No automation is currently running'
-        }), 400
-    
-    # Get campaign_id from request
+    # Get campaign_id from request first (before status check to avoid race condition)
     data = request.get_json() or {}
     campaign_id = data.get('campaign_id')
     
-    # Set abort signal
-    event_store.set_abort()
+    # Capture current status atomically
+    current_status = event_store.status
     
-    if campaign_id:
-        progress.warning(f'Abort requested for campaign {campaign_id} - stopping gracefully')
-        print(f'\n[ABORT] User requested abort for campaign: {campaign_id}')
+    if current_status == 'running':
+        # Set abort signal
+        event_store.set_abort()
+        
+        if campaign_id:
+            progress.warning(f'Abort requested for campaign {campaign_id} - stopping gracefully')
+            print(f'\n[ABORT] User requested abort for campaign: {campaign_id}')
+            # Update database immediately
+            try:
+                update_campaign_status(campaign_id, 'aborted')
+            except Exception as e:
+                print(f'[WARN] Could not update campaign status in DB: {e}')
+        else:
+            progress.warning('Abort requested - stopping automation gracefully')
+            print('\n[ABORT] User requested abort')
+        
+        return jsonify({
+            'status': 'aborting',
+            'message': 'Abort signal sent - automation will stop gracefully'
+        })
+    
+    elif current_status in ['completed', 'idle', 'error', 'aborted']:
+        return jsonify({
+            'status': 'not_running',
+            'message': f'No automation is currently running (status: {current_status})'
+        }), 200  # Return 200 since this isn't an error
+    
     else:
-        progress.warning('Abort requested - stopping automation gracefully')
-        print('\n[ABORT] User requested abort')
-    
-    return jsonify({
-        'status': 'aborting',
-        'message': 'Abort signal sent - resources will be cleaned up'
-    })
+        return jsonify({
+            'status': 'unknown',
+            'message': f'Unexpected status: {current_status}'
+        }), 400
 
 
 @app.route('/api/webhook/campaign-added', methods=['POST'])
@@ -1466,30 +1561,38 @@ async def navigate_with_retry(page: Page, url: str, max_retries: int = MAX_RETRI
 
 
 class CookieManager:
-    """Manages browser cookies per Instagram account"""
+    """Manages browser cookies per social account (platform + username)"""
     
     def __init__(self, cookies_dir: str = "cookies"):
         self.cookies_dir = Path(cookies_dir)
         self.cookies_dir.mkdir(exist_ok=True)
     
-    def _get_cookie_file(self, username: str) -> Path:
-        """Get the cookie file path for a specific username"""
-        # Sanitize username for filename
-        safe_username = "".join(c for c in username if c.isalnum() or c in "_-")
-        return self.cookies_dir / f"{safe_username}_cookies.json"
-    
-    def save_cookies(self, username: str, cookies: list) -> bool:
-        """
-        Save cookies for a specific Instagram account.
+    def _get_cookie_file(self, username: str, platform: str = "instagram") -> Path:
+        """Get the cookie file path for a specific platform + username
         
         Args:
-            username: Instagram username
+            username: Account username
+            platform: Social media platform (instagram, x, tiktok, etc.)
+        """
+        # Sanitize username and platform for filename
+        safe_username = "".join(c for c in username if c.isalnum() or c in "_-")
+        safe_platform = "".join(c for c in platform if c.isalnum() or c in "_-")
+        return self.cookies_dir / f"{safe_platform}_{safe_username}_cookies.json"
+    
+    def save_cookies(self, username: str, cookies: list, platform: str = "instagram") -> bool:
+        """
+        Save cookies for a specific social account.
+        
+        Args:
+            username: Account username
             cookies: List of cookie dictionaries from browser
+            platform: Social media platform (instagram, x, etc.)
         """
         try:
-            cookie_file = self._get_cookie_file(username)
+            cookie_file = self._get_cookie_file(username, platform)
             cookie_data = {
                 "username": username,
+                "platform": platform,
                 "cookies": cookies,
                 "saved_at": str(asyncio.get_event_loop().time()) if asyncio.get_event_loop().is_running() else "0"
             }
@@ -1501,19 +1604,20 @@ class CookieManager:
             progress.error(f'Failed to save session cookies')
             return False
     
-    def load_cookies(self, username: str) -> list | None:
+    def load_cookies(self, username: str, platform: str = "instagram") -> list | None:
         """
-        Load cookies for a specific Instagram account.
-        Verifies the cookies belong to the requested username.
+        Load cookies for a specific social account.
+        Verifies the cookies belong to the requested username and platform.
         
         Args:
-            username: Instagram username to load cookies for
+            username: Account username to load cookies for
+            platform: Social media platform (instagram, x, etc.)
             
         Returns:
             List of cookies if found and valid, None otherwise
         """
         try:
-            cookie_file = self._get_cookie_file(username)
+            cookie_file = self._get_cookie_file(username, platform)
             if not cookie_file.exists():
                 # No cookies - silent, this is expected for first login
                 return None
@@ -1521,11 +1625,18 @@ class CookieManager:
             with open(cookie_file, 'r') as f:
                 cookie_data = json.load(f)
             
-            # Verify the cookies belong to the correct account
+            # Verify the cookies belong to the correct account and platform
             stored_username = cookie_data.get("username", "")
+            stored_platform = cookie_data.get("platform", "instagram")
+            
             if stored_username.lower() != username.lower():
                 progress.warning(f'Session cookies belong to different account, clearing')
-                self.delete_cookies(username)
+                self.delete_cookies(username, platform)
+                return None
+            
+            if stored_platform.lower() != platform.lower():
+                progress.warning(f'Session cookies belong to different platform, clearing')
+                self.delete_cookies(username, platform)
                 return None
             
             cookies = cookie_data.get("cookies", [])
@@ -1538,16 +1649,21 @@ class CookieManager:
             
         except json.JSONDecodeError:
             progress.warning('Session cookies corrupted, clearing')
-            self.delete_cookies(username)
+            self.delete_cookies(username, platform)
             return None
         except Exception as e:
             # Silent failure on cookie load
             return None
     
-    def delete_cookies(self, username: str) -> bool:
-        """Delete saved cookies for a specific account"""
+    def delete_cookies(self, username: str, platform: str = "instagram") -> bool:
+        """Delete saved cookies for a specific account
+        
+        Args:
+            username: Account username
+            platform: Social media platform
+        """
         try:
-            cookie_file = self._get_cookie_file(username)
+            cookie_file = self._get_cookie_file(username, platform)
             if cookie_file.exists():
                 cookie_file.unlink()
                 # Silent cookie deletion
@@ -1556,9 +1672,14 @@ class CookieManager:
             # Silent failure
             return False
     
-    def has_cookies(self, username: str) -> bool:
-        """Check if cookies exist for a username"""
-        cookie_file = self._get_cookie_file(username)
+    def has_cookies(self, username: str, platform: str = "instagram") -> bool:
+        """Check if cookies exist for an account
+        
+        Args:
+            username: Account username
+            platform: Social media platform
+        """
+        cookie_file = self._get_cookie_file(username, platform)
         return cookie_file.exists()
 
 
@@ -2106,250 +2227,19 @@ class DolphinAntyClient:
         return response.status_code == 200
 
 
-# Instagram selectors for Playwright
-class InstagramSelectors:
-    """CSS/XPath selectors for Instagram elements"""
-    
-    # Login page
-    USERNAME_INPUT = 'input[name="username"]'
-    PASSWORD_INPUT = 'input[name="password"]'
-    LOGIN_BUTTON = 'button[type="submit"]'
-    
-    # Cookie consent
-    COOKIE_ACCEPT_BUTTON = 'button:has-text("Allow all cookies"), button:has-text("Accept"), button:has-text("Allow essential and optional cookies")'
-    
-    # Post-login prompts
-    SAVE_LOGIN_NOT_NOW = 'button:has-text("Not Now"), div[role="button"]:has-text("Not Now")'
-    NOTIFICATIONS_NOT_NOW = 'button:has-text("Not Now"), div[role="button"]:has-text("Not Now")'
-    
-    # Logged in indicators
-    HOME_NAV = 'a[href="/"], svg[aria-label="Home"]'
-    PROFILE_ICON = 'img[alt*="profile picture"], span[role="link"] img'
-    SEARCH_ICON = 'svg[aria-label="Search"], a[href="/explore/"]'
-    
-    # Profile page - Posts
-    POST_LINKS = 'a[href*="/p/"], a[href*="/reel/"]'
-    
-    # ===========================================
-    # INDIVIDUAL POST PAGE SELECTORS
-    # Based on Instagram's actual DOM structure
-    # ===========================================
-    
-    # COMMENT INPUT - the bottom bar with "Add a comment..."
-    # This is DIFFERENT from reply inputs within comment threads
-    # The main comment input is at the bottom of the post, has specific aria-label
-    # Structure: form > textarea[aria-label="Add a comment…"]
-    COMMENT_INPUT_FORM = 'article form textarea, section form textarea'
-    COMMENT_INPUT = 'textarea[aria-label="Add a comment…"], textarea[placeholder="Add a comment…"]'
-    
-    # POST BUTTON - appears ONLY after text is typed in the comment input
-    # It's a sibling/nearby element to the textarea, becomes visible when there's text
-    POST_COMMENT_BUTTON = 'div[role="button"]:text("Post"), button:text("Post"), form div:text("Post")'
-    
-    # Timestamp for filtering posts by date
-    POST_TIMESTAMP = 'time[datetime]'
-    
-    # Close button for post modal
-    CLOSE_POST_BUTTON = 'svg[aria-label="Close"], button[aria-label="Close"]'
-    
-    # Post modal navigation (for navigating between posts without page reload)
-    NEXT_POST_BUTTON = 'button[aria-label="Next"], div[role="button"] svg[aria-label="Next"]'
-    PREV_POST_BUTTON = 'button[aria-label="Go Back"], div[role="button"] svg[aria-label="Go Back"]'
-    
-    # Post row on profile grid
-    POST_ROW = 'article > div > div > div'
-    FIRST_POST = 'article a[href*="/p/"], article a[href*="/reel/"]'
-
-
-async def detect_bot_challenge(page: Page) -> bool:
-    """
-    Detect if Instagram is showing a bot challenge or human verification.
-    
-    Args:
-        page: Playwright page object
-    
-    Returns:
-        True if bot challenge detected, False otherwise
-    """
-    try:
-        page_content = await page.content()
-        
-        # Check for common bot challenge phrases
-        bot_challenge_phrases = [
-            "Prove that you are not a bot",
-            "Confirm you're human",
-            "Confirm you're not a bot",
-            "Verify you're human",
-            "Verify you're not a bot",
-            "We need to confirm that you're human",
-            "Complete the security check",
-            "Suspicious activity",
-            "Unusual activity",
-            "Enter your mobile number",
-            "You'll need to confirm this mobile number",
-            "confirm this mobile number with a code",
-            "Phone number verification",
-            "Add a phone number"
-        ]
-        
-        for phrase in bot_challenge_phrases:
-            if phrase.lower() in page_content.lower():
-                return True
-        
-        # Check for CAPTCHA elements
-        captcha_selectors = [
-            '[name="captcha"]',
-            '#captcha',
-            '.captcha',
-            '[data-testid="captcha"]'
-        ]
-        
-        for selector in captcha_selectors:
-            element = await page.query_selector(selector)
-            if element:
-                return True
-        
-        return False
-        
-    except Exception as e:
-        # If we can't detect, assume no challenge
-        return False
-
-
-async def verify_instagram_login(page: Page) -> bool:
-    """
-    Verify if we're logged into Instagram.
-    
-    Args:
-        page: Playwright page object
-    
-    Returns:
-        True if logged in, False otherwise
-    """
-    try:
-        # Check for logged-in elements
-        selectors_to_check = [
-            InstagramSelectors.HOME_NAV,
-            InstagramSelectors.SEARCH_ICON,
-            'svg[aria-label="New post"]',
-            'a[href*="/direct/inbox/"]',
-        ]
-        
-        for selector in selectors_to_check:
-            try:
-                element = await page.wait_for_selector(selector, timeout=3000)
-                if element:
-                    # Silent verification success
-                    return True
-            except:
-                continue
-        
-        # Also check if login form is NOT present (means we're logged in)
-        try:
-            login_form = await page.query_selector(InstagramSelectors.USERNAME_INPUT)
-            if login_form is None:
-                # No login form found, might be logged in
-                # Check URL
-                current_url = page.url
-                if 'login' not in current_url and 'accounts' not in current_url:
-                    # Silent verification success
-                    return True
-        except:
-            pass
-        
-        # Not logged in - silent return
-        return False
-        
-    except Exception as e:
-        # Silent verification failure
-        return False
-
-
-async def perform_instagram_login(page: Page, username: str, password: str):
-    """
-    Perform a fresh Instagram login using Playwright.
-    
-    Args:
-        page: Playwright page object
-        username: Instagram username/email/phone
-        password: Instagram password
-    """
-    # Navigate to Instagram login page with retry logic
-    progress.action('Navigating to login page')
-    await navigate_with_retry(page, 'https://www.instagram.com/accounts/login/?hl=en')
-    
-    # Check for bot challenge/verification screen after navigation
-    await asyncio.sleep(2)  # Wait for page to load
-    if await detect_bot_challenge(page):
-        raise Exception('Instagram account suspended - bot challenge or phone verification required')
-    
-    # Accept cookies if prompted
-    try:
-        cookie_button = await page.wait_for_selector(InstagramSelectors.COOKIE_ACCEPT_BUTTON, timeout=5000)
-        if cookie_button:
-            await cookie_button.click()
-            await asyncio.sleep(1)
-            progress.info('Cookie consent accepted', significant=False)
-    except:
-        # No cookie banner - silent continue
-        pass
-    
-    # Wait for login form
-    progress.action('Waiting for login form')
-    await page.wait_for_selector(InstagramSelectors.USERNAME_INPUT, timeout=15000)
-    await asyncio.sleep(1)
-    
-    # Enter username/email
-    progress.action(f'Entering credentials for {username}')
-    username_input = await page.query_selector(InstagramSelectors.USERNAME_INPUT)
-    await username_input.click()
-    await username_input.fill(username)
-    await asyncio.sleep(0.5)
-    
-    # Enter password
-    password_input = await page.query_selector(InstagramSelectors.PASSWORD_INPUT)
-    await password_input.click()
-    await password_input.fill(password)
-    await asyncio.sleep(0.5)
-    
-    # Click login button
-    progress.action('Submitting login form')
-    login_button = await page.query_selector(InstagramSelectors.LOGIN_BUTTON)
-    await login_button.click()
-    await asyncio.sleep(5)  # Wait for login to process
-    
-    # Handle "Save Your Login Info?" prompt if it appears
-    try:
-        not_now_button = await page.wait_for_selector(InstagramSelectors.SAVE_LOGIN_NOT_NOW, timeout=5000)
-        if not_now_button:
-            await not_now_button.click()
-            await asyncio.sleep(2)
-            progress.info('Declined to save login info', significant=False)
-    except:
-        # No save prompt - silent continue
-        pass
-    
-    # Handle "Turn on Notifications?" prompt if it appears
-    try:
-        not_now_button = await page.wait_for_selector(InstagramSelectors.NOTIFICATIONS_NOT_NOW, timeout=5000)
-        if not_now_button:
-            await not_now_button.click()
-            await asyncio.sleep(2)
-            progress.info('Declined notifications', significant=False)
-    except:
-        # No notifications prompt - silent continue
-        pass
-    
-    # Wait for page to stabilize
-    progress.info('Waiting for login to complete', significant=False)
-    await asyncio.sleep(3)
-    
-    # Check for bot challenge
-    if await detect_bot_challenge(page):
-        raise Exception('Instagram bot challenge detected - human verification required')
-
-
-
+# ===========================================
+# INSTAGRAM AUTOMATION (imported from instagram.py)
+# ===========================================
+# InstagramAutomation and InstagramSelectors are imported from instagram.py
+# See instagram.py for:
+#   - InstagramSelectors class (CSS/XPath selectors)
+#   - InstagramAutomation class:
+#       - login() - login verification and authentication
+#       - process_posts_by_count() - process fixed number of posts
+#       - process_posts_after_date() - process posts after a date threshold
+#       - comment_on_post() - add comment to a post
+#       - detect_bot_challenge() - detect Instagram bot challenges
+#       - and other Instagram-specific helper functions
 
 
 def parse_date_threshold(date_str: str) -> datetime:
@@ -2367,587 +2257,6 @@ def parse_date_threshold(date_str: str) -> datetime:
     except ValueError:
         # Silent fallback to default
         return datetime.now() - timedelta(days=7)
-
-
-def parse_instagram_timestamp(timestamp_str: str) -> datetime | None:
-    """
-    Parse Instagram's timestamp format to datetime.
-    Instagram uses ISO 8601 format in the datetime attribute.
-    
-    Args:
-        timestamp_str: ISO 8601 timestamp string
-        
-    Returns:
-        datetime object or None if parsing fails
-    """
-    try:
-        # Instagram uses ISO 8601 format: 2024-12-04T10:30:00.000Z
-        # Remove the 'Z' and parse
-        clean_timestamp = timestamp_str.replace('Z', '+00:00')
-        return datetime.fromisoformat(clean_timestamp.replace('+00:00', ''))
-    except Exception as e:
-        print(f'[WARN]  Could not parse timestamp: {timestamp_str} - {e}')
-        return None
-
-
-async def get_post_links_from_profile(page: Page, target_user: str, logger: AutomationLogger, max_posts: int = 50) -> list[str]:
-    """
-    Get post links from a user's profile page in chronological order (newest first).
-    Instagram displays posts in a grid, with newest posts at the top-left.
-    
-    Args:
-        page: Playwright page object
-        target_user: Instagram username
-        logger: AutomationLogger instance
-        max_posts: Maximum number of posts to collect
-        
-    Returns:
-        List of post URLs in order (newest first)
-    """
-    post_links = []
-    
-    try:
-        # Navigate to the user's profile with retry
-        progress.info(f'Loading profile page for @{target_user}', significant=False)
-        await navigate_with_retry(page, f'https://www.instagram.com/{target_user}/?hl=en')
-        
-        # Emit target opened checkpoint after successful navigation
-        progress.target_opened(target_user)
-        
-        # Wait for posts to load
-        await asyncio.sleep(2)
-        
-        # Collect posts while scrolling - Instagram loads more as you scroll
-        last_count = 0
-        scroll_attempts = 0
-        max_scroll_attempts = 10  # Limit scrolling to avoid infinite loops
-        
-        while len(post_links) < max_posts and scroll_attempts < max_scroll_attempts:
-            # Find all post links currently visible
-            post_elements = await page.query_selector_all(InstagramSelectors.POST_LINKS)
-            
-            for element in post_elements:
-                href = await element.get_attribute('href')
-                if href and ('/p/' in href or '/reel/' in href):
-                    full_url = f'https://www.instagram.com{href}' if href.startswith('/') else href
-                    if full_url not in post_links:
-                        post_links.append(full_url)
-                        logger.log_post_found()
-            
-            # Check if we found new posts
-            if len(post_links) == last_count:
-                scroll_attempts += 1
-            else:
-                scroll_attempts = 0  # Reset if we found new posts
-                last_count = len(post_links)
-            
-            # Scroll down to load more posts if needed
-            if len(post_links) < max_posts:
-                await page.evaluate('window.scrollBy(0, window.innerHeight)')
-                await asyncio.sleep(1.5)
-        
-        # Scroll back to top for clean state
-        await page.evaluate('window.scrollTo(0, 0)')
-        await asyncio.sleep(1)
-        
-        logger.log_success(f'Found {len(post_links)} posts on @{target_user} profile')
-        
-    except Exception as e:
-        progress.target_failed(target_user, f'Unable to access profile: {str(e)[:50]}')
-    
-    return post_links
-
-
-async def get_post_timestamp(page: Page) -> datetime | None:
-    """
-    Get the timestamp of the current post.
-    
-    Args:
-        page: Playwright page object (should be on a post page)
-        
-    Returns:
-        datetime object or None
-    """
-    try:
-        time_element = await page.wait_for_selector(InstagramSelectors.POST_TIMESTAMP, timeout=ELEMENT_TIMEOUT)
-        if time_element:
-            datetime_attr = await time_element.get_attribute('datetime')
-            if datetime_attr:
-                return parse_instagram_timestamp(datetime_attr)
-    except Exception as e:
-        print(f'[WARN]  Could not get post timestamp: {e}')
-    return None
-
-
-async def comment_on_post(page: Page, comment_text: str, logger: AutomationLogger) -> bool:
-    """
-    Add a comment to the current post.
-    Targets the comment input bar at the BOTTOM of the post (not reply fields in comments).
-    
-    The comment bar shows "Add a comment..." and the POST button only appears after typing.
-    
-    Args:
-        page: Playwright page object (should be on a post page)
-        comment_text: The comment to post
-        logger: AutomationLogger instance
-        
-    Returns:
-        True if comment was posted, False otherwise
-    """
-    
-    async def find_bottom_comment_input():
-        """
-        Find the main comment input at the bottom of the post.
-        This is different from reply inputs within the comment thread.
-        """
-        # Strategy 1: Find textarea with specific aria-label within a form
-        try:
-            # The bottom comment bar is usually in a form element
-            input_el = await page.query_selector('form textarea[aria-label="Add a comment…"]')
-            if input_el:
-                return input_el
-        except:
-            pass
-        
-        # Strategy 2: Use the form-based selector
-        try:
-            input_el = await page.query_selector(InstagramSelectors.COMMENT_INPUT_FORM)
-            if input_el:
-                return input_el
-        except:
-            pass
-        
-        # Strategy 3: Find via JavaScript - get the last/bottom-most comment textarea
-        try:
-            input_el = await page.evaluate_handle('''() => {
-                // Get all comment textareas
-                const textareas = document.querySelectorAll('textarea[aria-label="Add a comment…"], textarea[placeholder="Add a comment…"]');
-                if (textareas.length === 0) return null;
-                
-                // Find the one that's in a form (main comment input)
-                for (const ta of textareas) {
-                    const form = ta.closest('form');
-                    if (form) {
-                        return ta;
-                    }
-                }
-                
-                // Fallback: return the last textarea (usually the main one at bottom)
-                return textareas[textareas.length - 1];
-            }''')
-            if input_el:
-                return input_el
-        except:
-            pass
-        
-        # Strategy 4: Generic selector as last resort
-        try:
-            input_el = await page.query_selector(InstagramSelectors.COMMENT_INPUT)
-            if input_el:
-                return input_el
-        except:
-            pass
-        
-        return None
-    
-    async def find_post_button():
-        """
-        Find the POST button that appears after typing in the comment field.
-        This button only becomes visible/enabled after text is entered.
-        """
-        # Strategy 1: Find by text content
-        try:
-            # Look for elements with text "Post" near the comment input
-            btn = await page.query_selector('form div[role="button"]:has-text("Post"), form button:has-text("Post")')
-            if btn:
-                return btn
-        except:
-            pass
-        
-        # Strategy 2: Use JavaScript to find the Post button
-        try:
-            btn = await page.evaluate_handle('''() => {
-                // Find all elements with "Post" text
-                const elements = document.querySelectorAll('div[role="button"], button');
-                for (const el of elements) {
-                    if (el.textContent.trim() === 'Post') {
-                        // Make sure it's near a form/textarea (the comment form)
-                        const form = el.closest('form') || el.closest('section');
-                        if (form) {
-                            return el;
-                        }
-                    }
-                }
-                return null;
-            }''')
-            if btn:
-                return btn
-        except:
-            pass
-        
-        # Strategy 3: Use the selector from constants
-        try:
-            btn = await page.query_selector(InstagramSelectors.POST_COMMENT_BUTTON)
-            if btn:
-                return btn
-        except:
-            pass
-        
-        return None
-    
-    for attempt in range(IG_MAX_COMMENT_RETRIES):
-        try:
-            progress.info(f'Preparing to comment', significant=False)
-            
-            # Find the bottom comment input
-            comment_input = await find_bottom_comment_input()
-            
-            if not comment_input:
-                progress.warning(f'Comment box not found, retrying ({attempt + 1}/{IG_MAX_COMMENT_RETRIES})')
-                if attempt < IG_MAX_COMMENT_RETRIES - 1:
-                    await asyncio.sleep(1)
-                    continue
-                else:
-                    progress.error('Comment box not available after all retries')
-                    return False
-            
-            # Scroll the comment input into view (ensure we don't scroll away from post)
-            try:
-                await comment_input.scroll_into_view_if_needed()
-                await asyncio.sleep(get_random_delay(0.2, 0.5))
-            except:
-                pass
-            
-            # Human-like click on the comment input
-            await human_like_click(page, comment_input, logger)
-            await asyncio.sleep(get_random_delay(0.3, 0.7))
-            
-            # Clear any existing text
-            try:
-                await comment_input.fill('')
-                await asyncio.sleep(0.2)
-            except:
-                # If fill doesn't work, try selecting all and deleting
-                await comment_input.press('Meta+a')
-                await comment_input.press('Backspace')
-                await asyncio.sleep(0.2)
-            
-            # Type the comment with human-like patterns (variable delays, word pauses, occasional typos)
-            progress.info('Typing comment naturally', significant=False)
-            await human_like_type(page, comment_input, comment_text, logger)
-            
-            # Review pause - simulating reading back what was typed
-            await do_review_pause(logger)
-            
-            # Wait for the POST button to appear (it only shows after typing)
-            progress.info('Submitting comment', significant=False)
-            await asyncio.sleep(get_random_delay(0.3, 0.6))
-            
-            post_button = await find_post_button()
-            
-            if post_button:
-                # Human-like click on the POST button
-                await human_like_click(page, post_button, logger)
-                
-                await asyncio.sleep(get_random_delay(1.5, 2.5))
-                
-                # Verify comment was posted by checking if input is cleared
-                try:
-                    comment_input = await find_bottom_comment_input()
-                    if comment_input:
-                        current_value = await comment_input.input_value()
-                        if not current_value or len(current_value) < len(comment_text):
-                            logger.log_success(f'[OK] Comment posted successfully: "{comment_text}"')
-                            progress.info(f'Comment submitted: "{comment_text}"', significant=True)
-                            return True
-                except:
-                    # If we can't check, assume it worked
-                    logger.log_success(f'[OK] Comment likely posted: "{comment_text}"')
-                    progress.info(f'Comment submitted: "{comment_text}"', significant=True)
-                    return True
-                
-                progress.warning('Post button clicked but waiting for confirmation')
-            else:
-                progress.warning('Post button did not appear')
-                
-                # Fallback: Try pressing Enter to submit
-                await comment_input.press('Enter')
-                await asyncio.sleep(2)
-                
-                # Check if comment was posted
-                try:
-                    comment_input = await find_bottom_comment_input()
-                    if comment_input:
-                        current_value = await comment_input.input_value()
-                        if not current_value or len(current_value) < len(comment_text):
-                            logger.log_success(f'[OK] Comment posted via Enter: "{comment_text}"')
-                            return True
-                except:
-                    logger.log_success(f'[OK] Comment likely posted via Enter: "{comment_text}"')
-                    return True
-            
-        except Exception as e:
-            progress.warning(f'Comment attempt failed, retrying ({attempt + 1}/{IG_MAX_COMMENT_RETRIES})')
-            if attempt < IG_MAX_COMMENT_RETRIES - 1:
-                await asyncio.sleep(1)
-    
-    progress.error(f'Could not submit comment after {IG_MAX_COMMENT_RETRIES} attempts')
-    return False
-
-
-async def process_posts_after_date(
-    page: Page,
-    target_user: str, 
-    date_threshold: datetime,
-    comment_text: str,
-    logger: AutomationLogger,
-    post_delay: float = None
-) -> dict:
-    """
-    Process posts from a user that were posted after the given date.
-    Comments on each qualifying post.
-    
-    Uses early termination: since Instagram posts are displayed newest first,
-    once we encounter CONSECUTIVE_OLD_POSTS_LIMIT posts older than the threshold,
-    we stop processing to avoid unnecessary work.
-    
-    Args:
-        page: Playwright page object
-        target_user: Instagram username to process posts from
-        date_threshold: Only process posts after this date
-        comment_text: Comment to post on each post
-        logger: AutomationLogger instance
-        post_delay: User-configured delay between posts (seconds)
-        
-    Returns:
-        Dict with processing results
-    """
-    result = {
-        "success": True,
-        "posts_found": 0,
-        "posts_processed": 0,
-        "posts_commented": 0,
-        "posts_skipped": 0,
-        "stopped_early": False,
-        "errors": []
-    }
-    
-    progress.scanning_posts(target_user)
-    
-    # Get post links from the profile (newest first)
-    post_links = await get_post_links_from_profile(page, target_user, logger)
-    result["posts_found"] = len(post_links)
-    
-    if not post_links:
-        progress.posts_scan_failed(target_user, "No posts found")
-        return result
-    
-    # Emit posts scanned checkpoint
-    progress.posts_scanned(target_user, len(post_links))
-    
-    # Track consecutive old posts for early termination
-    consecutive_old_posts = 0
-    
-    # Process each post (newest to oldest)
-    for i, post_url in enumerate(post_links):
-        # Check for abort signal
-        if event_store.is_aborted():
-            progress.warning('Post processing aborted by user')
-            result["stopped_early"] = True
-            break
-        
-        progress.info(f'Analyzing post {i + 1} of {len(post_links)}', significant=False)
-        
-        try:
-            # Navigate to the post with retry
-            await navigate_with_retry(page, post_url)
-            
-            # Get the post timestamp
-            post_date = await get_post_timestamp(page)
-            
-            if post_date:
-                progress.info(f'Post from {post_date.strftime("%b %d")}', significant=False)
-                
-                # Check if post is after the threshold date
-                if post_date < date_threshold:
-                    consecutive_old_posts += 1
-                    progress.post_skipped(f'post too old ({consecutive_old_posts}/{CONSECUTIVE_OLD_POSTS_LIMIT})')
-                    logger.log_post_processed(skipped=True)
-                    result["posts_skipped"] += 1
-                    
-                    # Early termination: stop if we've hit too many consecutive old posts
-                    if consecutive_old_posts >= CONSECUTIVE_OLD_POSTS_LIMIT:
-                        progress.warning(f'Stopping after {CONSECUTIVE_OLD_POSTS_LIMIT} consecutive old posts')
-                        result["stopped_early"] = True
-                        break
-                    continue
-                else:
-                    # Reset counter when we find a new post
-                    consecutive_old_posts = 0
-            else:
-                progress.info('Processing post (date unavailable)', significant=False)
-                # Don't count as old post if we can't determine date
-            
-            # Comment on the post
-            progress.commenting_on_post(i + 1, len(post_links), target_user)
-            commented = await comment_on_post(page, comment_text, logger)
-            if commented:
-                result["posts_commented"] += 1
-                progress.comment_posted(target_user, result["posts_commented"], len(post_links))
-            else:
-                progress.comment_failed(target_user, i + 1, len(post_links), "Could not submit comment")
-            
-            logger.log_post_processed(commented=commented)
-            result["posts_processed"] += 1
-            
-            # Human-like delay between posts with user-configured base delay
-            await do_post_to_post_delay(post_delay, logger)
-            
-        except Exception as e:
-            error_msg = f'Error processing post {post_url}: {e}'
-            progress.error(f'Post processing failed: {str(e)[:50]}')
-            result["errors"].append(error_msg)
-            # Continue to next post even if this one fails
-    
-    return result
-
-
-async def process_posts_by_count(
-    page: Page, 
-    target_user: str, 
-    post_count: int,
-    comment_text: str,
-    logger: AutomationLogger,
-    post_delay: float = None
-) -> dict:
-    """
-    Process a fixed number of posts from a user (newest first).
-    Comments on the specified number of posts.
-    
-    Args:
-        page: Playwright page object
-        target_user: Instagram username to process posts from
-        post_count: Number of posts to process
-        comment_text: Comment to post on each post
-        logger: AutomationLogger instance
-        post_delay: User-configured delay between posts (seconds)
-        
-    Returns:
-        Dict with processing results
-    """
-    result = {
-        "success": True,
-        "posts_found": 0,
-        "posts_processed": 0,
-        "posts_commented": 0,
-        "posts_skipped": 0,
-        "stopped_early": False,
-        "errors": []
-    }
-    
-    progress.scanning_posts(target_user)
-    
-    # Get post links from the profile (newest first)
-    post_links = await get_post_links_from_profile(page, target_user, logger)
-    result["posts_found"] = len(post_links)
-    
-    if not post_links:
-        progress.posts_scan_failed(target_user, "No posts found")
-        return result
-    
-    # Limit to the specified number of posts
-    posts_to_process = post_links[:post_count]
-    
-    # Emit posts scanned checkpoint
-    progress.posts_scanned(target_user, len(posts_to_process))
-    
-    # Process each post
-    for i, post_url in enumerate(posts_to_process):
-        # Check for abort signal
-        if event_store.is_aborted():
-            progress.warning('Post processing aborted by user')
-            result["stopped_early"] = True
-            break
-        
-        progress.info(f'Analyzing post {i + 1} of {len(posts_to_process)}', significant=False)
-        
-        try:
-            # Navigate to the post with retry
-            await navigate_with_retry(page, post_url)
-            
-            # Get the post timestamp (for logging purposes)
-            post_date = await get_post_timestamp(page)
-            if post_date:
-                progress.info(f'Post from {post_date.strftime("%b %d")}', significant=False)
-            
-            # Comment on the post
-            progress.commenting_on_post(i + 1, len(posts_to_process), target_user)
-            commented = await comment_on_post(page, comment_text, logger)
-            if commented:
-                result["posts_commented"] += 1
-                progress.comment_posted(target_user, result["posts_commented"], len(posts_to_process))
-            else:
-                progress.comment_failed(target_user, i + 1, len(posts_to_process), "Could not submit comment")
-            
-            logger.log_post_processed(commented=commented)
-            result["posts_processed"] += 1
-            
-            # Human-like delay between posts with user-configured base delay
-            await do_post_to_post_delay(post_delay, logger)
-            
-        except Exception as e:
-            error_msg = f'Error processing post {post_url}: {e}'
-            progress.error(f'Post processing failed: {str(e)[:50]}')
-            result["errors"].append(error_msg)
-            # Continue to next post even if this one fails
-    
-    return result
-
-
-async def instagram_login(page: Page, username: str, password: str, target_user: str):
-    """
-    Check Instagram login status and login if needed.
-    Browser profiles maintain their own sessions.
-    
-    Args:
-        page: Playwright page object
-        username: Instagram username/email/phone
-        password: Instagram password
-        target_user: Instagram username to navigate to
-    
-    Raises:
-        Exception: If bot challenge is detected
-    """
-    
-    # Navigate to Instagram and check if already logged in
-    progress.action('Checking login status')
-    await navigate_with_retry(page, 'https://www.instagram.com/?hl=en')
-    
-    # Check for bot challenge immediately
-    if await detect_bot_challenge(page):
-        raise Exception('Instagram bot challenge detected - account flagged for verification')
-    
-    # Verify if we're already logged in
-    is_logged_in = await verify_instagram_login(page)
-    
-    if is_logged_in:
-        progress.success(f'Already logged in as @{username}')
-    else:
-        # Not logged in, perform fresh login
-        progress.warning('Not logged in, logging in now')
-        await perform_instagram_login(page, username, password)
-        
-        # Check for bot challenge after login
-        if await detect_bot_challenge(page):
-            raise Exception('Instagram bot challenge detected - human verification required')
-    
-    # Navigate to target user's profile with retry
-    progress.navigating_to_profile(target_user)
-    await navigate_with_retry(page, f'https://www.instagram.com/{target_user}/?hl=en')
-    
-    # Final bot challenge check after navigation
-    if await detect_bot_challenge(page):
-        raise Exception('Instagram bot challenge detected on profile page')
 
 
 # ===========================================
@@ -3082,12 +2391,26 @@ def get_account_credentials(username: str, platform: str = 'instagram'):
     """
     try:
         supabase = get_supabase_client()
-        response = supabase.table('social_accounts').select('username,password,browser_profile').eq('username', username).eq('platform', platform).eq('is_active', True).limit(1).execute()
+        
+        # Try both with and without @ symbol to handle different storage formats
+        usernames_to_try = []
+        if username:
+            clean_username = username.lstrip('@')
+            usernames_to_try = [clean_username, f'@{clean_username}']
+        
+        print(f'[DEBUG] Looking up credentials: usernames={usernames_to_try}, platform="{platform}"')
+        
+        # Try to find account with either username format
+        response = supabase.table('social_accounts').select('username,password,browser_profile').in_('username', usernames_to_try).eq('platform', platform).eq('is_active', True).limit(1).execute()
         
         if response.data and len(response.data) > 0:
+            found_username = response.data[0].get('username')
+            print(f'[DEBUG] ✓ Found credentials for "{found_username}" on {platform}')
             return response.data[0]
         else:
             print(f'[WARN] No credentials found for {username} on {platform}')
+            print(f'[DEBUG] Tried usernames: {usernames_to_try}')
+            print(f'[DEBUG] Query returned {len(response.data) if response.data else 0} results')
             return None
     except Exception as e:
         print(f'[ERR] Could not get account credentials: {e}')
@@ -3121,6 +2444,52 @@ def validate_accounts_status(usernames: list, platform: str = 'instagram') -> di
     except Exception as e:
         print(f'[ERR] Could not validate accounts status: {e}')
         return {'valid': False, 'inactive_accounts': []}
+
+
+def get_platform_browser_profiles(platform: str) -> list:
+    """
+    Get browser profiles assigned to active accounts for a specific platform.
+    
+    This ensures proper separation between platforms - X campaigns only see
+    browser profiles with X accounts, Instagram campaigns only see Instagram profiles, etc.
+    
+    Args:
+        platform: Social media platform ('instagram', 'x', 'tiktok', etc.)
+        
+    Returns:
+        List of dicts with 'username' and 'browser_profile' for the platform
+    """
+    try:
+        supabase = get_supabase_client()
+        response = supabase.table('social_accounts').select(
+            'username,browser_profile'
+        ).eq('platform', platform).eq('is_active', True).execute()
+        
+        if response.data:
+            # Filter out accounts without browser profiles
+            profiles = [
+                acc for acc in response.data 
+                if acc.get('browser_profile')
+            ]
+            return profiles
+        return []
+    except Exception as e:
+        print(f'[ERR] Could not get browser profiles for platform {platform}: {e}')
+        return []
+
+
+def get_platform_account_count(platform: str) -> int:
+    """
+    Get count of active accounts with browser profiles for a specific platform.
+    
+    Args:
+        platform: Social media platform
+        
+    Returns:
+        Count of active accounts with assigned browser profiles
+    """
+    profiles = get_platform_browser_profiles(platform)
+    return len(profiles)
 
 
 def get_env_config():
@@ -3193,9 +2562,10 @@ async def run_campaign_preflight_checks(campaign: dict) -> PreFlightCheckResult:
     1. Campaign has required fields
     2. User accounts are specified
     3. Target profiles are specified
-    4. Account credentials exist in database
+    4. Account credentials exist in database (platform-specific)
     5. Dolphin Anty is reachable
-    6. Dolphin Anty has available browser profiles
+    6. Browser profiles exist for the platform
+    7. Assigned browser profile exists in Dolphin Anty
     
     Args:
         campaign: Campaign dictionary from database
@@ -3214,11 +2584,15 @@ async def run_campaign_preflight_checks(campaign: dict) -> PreFlightCheckResult:
     if errors:
         return PreFlightCheckResult(False, "Campaign missing required configuration", errors)
     
+    # Extract platform early for platform-specific checks
+    platform = campaign.get('platform', 'instagram')
+    platform_label = 'X/Twitter' if platform == 'x' else platform.capitalize()
+    
     # Check 2: User accounts specified
     user_accounts = campaign.get('user_accounts', [])
     if not user_accounts or len(user_accounts) == 0:
-        errors.append('No user accounts specified in campaign')
-        return PreFlightCheckResult(False, "No accounts configured", errors)
+        errors.append(f'No {platform_label} accounts specified in campaign')
+        return PreFlightCheckResult(False, f"No {platform_label} accounts configured", errors)
     
     # Check 3: Target profiles specified
     target_profiles = campaign.get('target_profiles', [])
@@ -3226,19 +2600,18 @@ async def run_campaign_preflight_checks(campaign: dict) -> PreFlightCheckResult:
         errors.append('No target profiles specified in campaign')
         return PreFlightCheckResult(False, "No target profiles configured", errors)
     
-    # Check 4: Account credentials exist
-    platform = campaign.get('platform', 'instagram')
+    # Check 4: Account credentials exist (platform-specific)
     account_username = user_accounts[0]
     
     credentials = get_account_credentials(account_username, platform)
     if not credentials:
-        errors.append(f'Account credentials not found: @{account_username}')
-        return PreFlightCheckResult(False, f"Account credentials missing for @{account_username}", errors)
+        errors.append(f'{platform_label} account credentials not found: @{account_username}')
+        return PreFlightCheckResult(False, f"{platform_label} account credentials missing for @{account_username}", errors)
     
-    # Check 4b: Browser profile is assigned
+    # Check 4b: Browser profile is assigned to this platform account
     browser_profile_name = credentials.get('browser_profile', '')
     if not browser_profile_name:
-        errors.append(f'No browser profile assigned to account @{account_username}')
+        errors.append(f'No browser profile assigned to {platform_label} account @{account_username}')
         return PreFlightCheckResult(False, f"Browser profile not assigned to @{account_username}", errors)
     
     # Check 5: Dolphin Anty connection
@@ -3248,7 +2621,18 @@ async def run_campaign_preflight_checks(campaign: dict) -> PreFlightCheckResult:
         errors.append('Cannot connect to Dolphin Anty - browser service not running')
         return PreFlightCheckResult(False, "Anti-detect browser unreachable", errors)
     
-    # Check 6: Assigned browser profile exists in Dolphin Anty
+    # Check 6: Get platform-specific browser profiles (for logging/info)
+    platform_profiles = get_platform_browser_profiles(platform)
+    platform_profile_count = len(platform_profiles)
+    print(f'[CHECK] Found {platform_profile_count} browser profile(s) for {platform_label}')
+    for p in platform_profiles:
+        print(f'  - @{p.get("username")} -> {p.get("browser_profile")}')
+    
+    if platform_profile_count == 0:
+        errors.append(f'No browser profiles configured for {platform_label} accounts')
+        return PreFlightCheckResult(False, f"No {platform_label} browser profiles available", errors)
+    
+    # Check 7: Assigned browser profile exists in Dolphin Anty
     # Try to find by name first (primary method), then by ID as fallback
     profile = dolphin.find_profile_by_name(browser_profile_name)
     if not profile:
@@ -3261,7 +2645,7 @@ async def run_campaign_preflight_checks(campaign: dict) -> PreFlightCheckResult:
     # All checks passed
     return PreFlightCheckResult(
         success=True,
-        message=f"All checks passed - ready to run campaign {campaign.get('campaign_id')}"
+        message=f"All checks passed - ready to run {platform_label} campaign {campaign.get('campaign_id')}"
     )
 
 
@@ -3333,6 +2717,13 @@ async def run_automation_with_dolphin_anty():
                 print(f'  - {error}')
                 progress.warning(error)
             
+            # Update campaign status to 'failed' to prevent polling worker from re-detecting it
+            try:
+                update_campaign_status(campaign_id, 'failed')
+                print(f'[STATUS] Campaign {campaign_id} marked as failed due to pre-flight check failures')
+            except Exception as e:
+                print(f'[WARN] Could not update campaign status: {e}')
+            
             campaign_results.append({
                 'campaign_id': campaign_id,
                 'status': 'skipped',
@@ -3340,14 +2731,18 @@ async def run_automation_with_dolphin_anty():
                 'errors': check_result.errors
             })
             
-            # Skip to next campaign (DO NOT change status from 'not-started')
+            # Skip to next campaign
             continue
+        
+        # Extract platform for logging
+        platform = campaign.get('platform', 'instagram')
+        platform_label = 'X/Twitter' if platform == 'x' else platform.capitalize()
         
         print(f'[OK] All pre-flight checks passed!')
         print(f'    - Campaign configuration valid')
-        print(f'    - Account credentials found')
+        print(f'    - {platform_label} account credentials found')
         print(f'    - Anti-detect browser connected')
-        print(f'    - Browser profiles available')
+        print(f'    - {platform_label} browser profiles available')
         print(f'    - Note: Account suspension status will be verified during execution')
         
         # ====================================================================
@@ -3356,8 +2751,7 @@ async def run_automation_with_dolphin_anty():
         print(f'\n[STATUS] Updating campaign status to: in-progress')
         update_campaign_status(campaign_id, 'in-progress')
         
-        # Extract campaign configuration
-        platform = campaign.get('platform', 'instagram')
+        # Extract campaign configuration (platform already extracted above)
         user_accounts = campaign.get('user_accounts', [])
         target_users = campaign.get('target_profiles', [])
         comment_text = campaign.get('custom_comment', 'Great post!')
@@ -3428,8 +2822,8 @@ async def run_automation_with_dolphin_anty():
                 all_accounts_successful = False
                 continue
             
-            instagram_username = credentials['username']
-            instagram_password = credentials['password']
+            account_creds_username = credentials['username']
+            account_creds_password = credentials['password']
             browser_profile_name = credentials.get('browser_profile', '')
             
             if not browser_profile_name:
@@ -3438,12 +2832,13 @@ async def run_automation_with_dolphin_anty():
                 continue
             
             # Print configuration for this account
+            # platform_label is defined earlier in the preflight success block
             print('\n' + '='*50)
-            print('[CONFIG] CONFIGURATION')
+            print(f'[CONFIG] {platform_label.upper()} CAMPAIGN CONFIGURATION')
             print('='*50)
             print(f'   Campaign ID: {campaign_id}')
-            print(f'   Platform: {platform.upper()}')
-            print(f'   Account: @{instagram_username}')
+            print(f'   Platform: {platform_label}')
+            print(f'   Account: @{account_creds_username}')
             print(f'   Browser Profile: {browser_profile_name}')
             print(f'   Target Profiles ({len(target_users)}): ' + ', '.join([f'@{u}' for u in target_users]))
             print(f'   Comment Text: "{comment_text}"')
@@ -3470,20 +2865,22 @@ async def run_automation_with_dolphin_anty():
                 if not dolphin.login(show_progress=True):
                     raise Exception("Failed to connect to Dolphin Anty")
                 
-                # Get and display all available profiles
-                print('[CONFIG] Fetching browser profiles...')
-                all_profiles = dolphin.get_profiles()
-                if all_profiles:
-                    print(f'[CONFIG] Found {len(all_profiles)} profile(s):')
-                    for p in all_profiles:
-                        print(f'  - ID: {p.get("id")}, Name: {p.get("name")}')
+                # Get and display browser profiles for this platform ONLY
+                # This ensures X campaigns see X profiles, Instagram campaigns see Instagram profiles
+                # Note: platform_label is defined earlier in the preflight success block
+                print(f'[CONFIG] Fetching {platform_label} browser profiles...')
+                platform_profiles = get_platform_browser_profiles(platform)
+                if platform_profiles:
+                    print(f'[CONFIG] Found {len(platform_profiles)} {platform_label} profile(s):')
+                    for p in platform_profiles:
+                        print(f'  - @{p.get("username")} -> {p.get("browser_profile")}')
                     print()
                 else:
-                    print('[WARN] No browser profiles found\n')
+                    print(f'[WARN] No browser profiles found for {platform_label}\n')
                 
                 # Find the assigned browser profile by name
                 if not browser_profile_name:
-                    raise Exception(f"No browser profile assigned to account @{instagram_username}")
+                    raise Exception(f"No browser profile assigned to account @{account_creds_username}")
                 
                 print(f"[>>] Looking for assigned profile: {browser_profile_name}")
                 
@@ -3549,83 +2946,199 @@ async def run_automation_with_dolphin_anty():
                     context = await browser.new_context()
                     page = await context.new_page()
                 
-                # Instagram login automation
-                print('='*50)
-                print('📸 STARTING INSTAGRAM AUTOMATION (Playwright)')
-                print('='*50 + '\n')
+                # ============================================================
+                # PLATFORM-SPECIFIC AUTOMATION
+                # ============================================================
                 
-                first_target = target_users[0]
-                progress.logging_in(instagram_username)
-                try:
-                    await instagram_login(
-                        page=page,
-                        username=instagram_username,
-                        password=instagram_password,
-                        target_user=first_target
+                if platform == 'x':
+                    # X/Twitter automation
+                    print('='*50)
+                    print('🐦 STARTING X/TWITTER AUTOMATION (Playwright)')
+                    print('='*50 + '\n')
+                    
+                    # Create human-like functions dict for TwitterAutomation
+                    human_like_funcs = {
+                        'human_like_click': human_like_click,
+                        'human_like_type': human_like_type,
+                        'human_like_mouse_move': human_like_mouse_move,
+                        'get_random_delay': get_random_delay,
+                        'do_review_pause': do_review_pause,
+                        'do_post_to_post_delay': do_post_to_post_delay,
+                        'do_profile_to_profile_delay': do_profile_to_profile_delay,
+                        'navigate_with_retry': navigate_with_retry,
+                    }
+                    
+                    # Initialize Twitter automation
+                    twitter_bot = TwitterAutomation(
+                        progress_emitter=progress,
+                        event_store=event_store,
+                        human_like_funcs=human_like_funcs
                     )
-                    progress.login_success(instagram_username)
-                except Exception as login_error:
-                    progress.login_failed(instagram_username, str(login_error)[:100])
-                    raise  # Re-raise to be caught by outer exception handler
-                
-                print('\n' + '='*50)
-                print('[OK] LOGIN PHASE COMPLETED!')
-                print('='*50)
-                
-                # Process posts for each target user
-                all_results = []
-                
-                for idx, target_user in enumerate(target_users, 1):
-                    # Check for abort signal before processing each target
-                    if event_store.is_aborted():
-                        print('\n[ABORT] Abort signal detected - stopping target processing')
-                        progress.warning('Skipping remaining targets due to abort')
-                        break
+                    
+                    first_target = target_users[0]
+                    progress.logging_in(account_creds_username)
+                    try:
+                        await twitter_bot.login(
+                            page=page,
+                            username=account_creds_username,
+                            password=account_creds_password,
+                            target_user=first_target
+                        )
+                        progress.login_success(account_creds_username)
+                    except Exception as login_error:
+                        progress.login_failed(account_creds_username, str(login_error)[:100])
+                        raise
                     
                     print('\n' + '='*50)
-                    print(f'[PROFILE] PROCESSING TARGET {idx}/{len(target_users)}: @{target_user}')
+                    print('[OK] LOGIN PHASE COMPLETED!')
                     print('='*50)
+                    
+                    # Process tweets for each target user
+                    all_results = []
+                    
+                    for idx, target_user in enumerate(target_users, 1):
+                        if event_store.is_aborted():
+                            print('\n[ABORT] Abort signal detected - stopping target processing')
+                            progress.warning('Skipping remaining targets due to abort')
+                            break
+                        
+                        print('\n' + '='*50)
+                        print(f'[PROFILE] PROCESSING TARGET {idx}/{len(target_users)}: @{target_user}')
+                        print('='*50)
+                        
+                        progress.navigating_to_profile(target_user)
+                        user_logger = AutomationLogger()
+                        
+                        if mode == 'count':
+                            post_result = await twitter_bot.process_posts_by_count(
+                                page=page,
+                                target_user=target_user,
+                                post_count=post_count,
+                                comment_text=comment_text,
+                                logger=user_logger,
+                                post_delay=post_delay
+                            )
+                        else:
+                            post_result = await twitter_bot.process_posts_after_date(
+                                page=page,
+                                target_user=target_user,
+                                date_threshold=date_threshold,
+                                comment_text=comment_text,
+                                logger=user_logger,
+                                post_delay=post_delay
+                            )
+                        
+                        print(f'\n[OK] COMPLETED @{target_user}')
+                        user_logger.print_summary(stopped_early=post_result.get("stopped_early", False))
+                        
+                        comments_posted = post_result.get('posts_commented', 0)
+                        progress.target_completed(target_user, comments_posted)
+                        
+                        all_results.append({
+                            "target_user": target_user,
+                            "result": post_result
+                        })
+                        
+                        if idx < len(target_users):
+                            await do_profile_to_profile_delay(idx, logger)
                 
-                    progress.navigating_to_profile(target_user)
-                    user_logger = AutomationLogger()
+                else:
+                    # Instagram automation (default)
+                    print('='*50)
+                    print('📸 STARTING INSTAGRAM AUTOMATION (Playwright)')
+                    print('='*50 + '\n')
                     
-                    if mode == 'count':
-                        post_result = await process_posts_by_count(
+                    # Create human-like functions dict for InstagramAutomation
+                    human_like_funcs = {
+                        'human_like_click': human_like_click,
+                        'human_like_type': human_like_type,
+                        'human_like_mouse_move': human_like_mouse_move,
+                        'get_random_delay': get_random_delay,
+                        'do_review_pause': do_review_pause,
+                        'do_post_to_post_delay': do_post_to_post_delay,
+                        'do_profile_to_profile_delay': do_profile_to_profile_delay,
+                        'navigate_with_retry': navigate_with_retry,
+                    }
+                    
+                    # Initialize Instagram automation
+                    instagram_bot = InstagramAutomation(
+                        progress_emitter=progress,
+                        event_store=event_store,
+                        human_like_funcs=human_like_funcs
+                    )
+                    
+                    first_target = target_users[0]
+                    progress.logging_in(account_creds_username)
+                    try:
+                        await instagram_bot.login(
                             page=page,
-                            target_user=target_user,
-                            post_count=post_count,
-                            comment_text=comment_text,
-                            logger=user_logger,
-                            post_delay=post_delay
+                            username=account_creds_username,
+                            password=account_creds_password,
+                            target_user=first_target
                         )
-                    else:
-                        post_result = await process_posts_after_date(
-                            page=page,
-                            target_user=target_user,
-                            date_threshold=date_threshold,
-                            comment_text=comment_text,
-                            logger=user_logger,
-                            post_delay=post_delay
-                        )
+                        progress.login_success(account_creds_username)
+                    except Exception as login_error:
+                        progress.login_failed(account_creds_username, str(login_error)[:100])
+                        raise  # Re-raise to be caught by outer exception handler
                     
-                    print(f'\n[OK] COMPLETED @{target_user}')
-                    user_logger.print_summary(stopped_early=post_result.get("stopped_early", False))
+                    print('\n' + '='*50)
+                    print('[OK] LOGIN PHASE COMPLETED!')
+                    print('='*50)
                     
-                    # Emit target completed checkpoint
-                    comments_posted = post_result.get('posts_commented', 0)
-                    progress.target_completed(target_user, comments_posted)
+                    # Process posts for each target user
+                    all_results = []
                     
-                    all_results.append({
-                        "target_user": target_user,
-                        "result": post_result
-                    })
+                    for idx, target_user in enumerate(target_users, 1):
+                        # Check for abort signal before processing each target
+                        if event_store.is_aborted():
+                            print('\n[ABORT] Abort signal detected - stopping target processing')
+                            progress.warning('Skipping remaining targets due to abort')
+                            break
+                        
+                        print('\n' + '='*50)
+                        print(f'[PROFILE] PROCESSING TARGET {idx}/{len(target_users)}: @{target_user}')
+                        print('='*50)
                     
-                    if idx < len(target_users):
-                        await do_profile_to_profile_delay(idx, logger)
+                        progress.navigating_to_profile(target_user)
+                        user_logger = AutomationLogger()
+                        
+                        if mode == 'count':
+                            post_result = await instagram_bot.process_posts_by_count(
+                                page=page,
+                                target_user=target_user,
+                                post_count=post_count,
+                                comment_text=comment_text,
+                                logger=user_logger,
+                                post_delay=post_delay
+                            )
+                        else:
+                            post_result = await instagram_bot.process_posts_after_date(
+                                page=page,
+                                target_user=target_user,
+                                date_threshold=date_threshold,
+                                comment_text=comment_text,
+                                logger=user_logger,
+                                post_delay=post_delay
+                            )
+                        
+                        print(f'\n[OK] COMPLETED @{target_user}')
+                        user_logger.print_summary(stopped_early=post_result.get("stopped_early", False))
+                        
+                        # Emit target completed checkpoint
+                        comments_posted = post_result.get('posts_commented', 0)
+                        progress.target_completed(target_user, comments_posted)
+                        
+                        all_results.append({
+                            "target_user": target_user,
+                            "result": post_result
+                        })
+                        
+                        if idx < len(target_users):
+                            await do_profile_to_profile_delay(idx, logger)
                 
                 # Print summary for this account
                 print('\n' + '='*50)
-                print(f'[OK] ACCOUNT @{instagram_username} COMPLETED!')
+                print(f'[OK] ACCOUNT @{account_creds_username} COMPLETED!')
                 print('='*50)
                 for result_data in all_results:
                     user = result_data['target_user']
@@ -3640,18 +3153,18 @@ async def run_automation_with_dolphin_anty():
                 account_success = True
                 
                 if account_success:
-                    print(f'\n[OK] Account @{instagram_username} completed successfully')
+                    print(f'\n[OK] Account @{account_creds_username} completed successfully')
                 else:
-                    print(f'\n[WARN] Account @{instagram_username} had errors')
+                    print(f'\n[WARN] Account @{account_creds_username} had errors')
                     all_accounts_successful = False
                 
             except Exception as e:
-                print(f'\n[ERR] Account automation error for @{instagram_username}: {e}')
+                print(f'\n[ERR] Account automation error for @{account_creds_username}: {e}')
                 
                 # Check if it's an abort signal
                 if event_store.is_aborted():
                     print(f'[ABORT] Abort detected during error handling')
-                    progress.warning(f'Campaign aborted - cleaning up @{instagram_username}')
+                    progress.warning(f'Campaign aborted - cleaning up @{account_creds_username}')
                     account_success = False
                     all_accounts_successful = False
                     # Break out of account loop - abort requested
@@ -3661,11 +3174,11 @@ async def run_automation_with_dolphin_anty():
                       'human verification' in str(e).lower() or 
                       'account suspended' in str(e).lower() or
                       'phone verification' in str(e).lower()):
-                    print(f'[ERR] Instagram account suspended - account @{instagram_username} is flagged')
-                    progress.error(f'Campaign failed: Account @{instagram_username} is suspended')
+                    print(f'[ERR] {platform_label} account suspended - account @{account_creds_username} is flagged')
+                    progress.error(f'Campaign failed: Account @{account_creds_username} is suspended')
                     
                     # Deactivate the suspended account
-                    deactivate_account(instagram_username, platform)
+                    deactivate_account(account_creds_username, platform)
                     
                     # Mark campaign as failed
                     update_campaign_status(campaign_id, 'failed')
@@ -3673,13 +3186,13 @@ async def run_automation_with_dolphin_anty():
                     # Break out of account loop - no point trying other accounts
                     break
                 else:
-                    progress.error(f'Error with @{instagram_username}: {str(e)[:100]}')
+                    progress.error(f'Error with @{account_creds_username}: {str(e)[:100]}')
                 
                 account_success = False
                 all_accounts_successful = False
                 
             finally:
-                print(f'\n[CLEANUP] Cleaning up browser resources for @{instagram_username}...')
+                print(f'\n[CLEANUP] Cleaning up browser resources for @{account_creds_username}...')
                 progress.cleanup()
                 try:
                     if browser:
@@ -3832,31 +3345,46 @@ if __name__ == '__main__':
     # Check if running as API server or direct automation
     if len(sys.argv) > 1 and sys.argv[1] == 'api':
         # Run Flask API server
-        print('[SERVER] Starting Instagram Comment Bot API Server...')
+        print('[SERVER] Starting Social Media Comment Bot API Server...')
         print(f'[API] Documentation: http://localhost:{PORT}/api/docs')
         print(f'[API] Current Progress: http://localhost:{PORT}/api/progress/current')
         print(f'[API] Event Feed: http://localhost:{PORT}/api/progress/events')
+        print(f'[ENV] Production mode: {IS_PRODUCTION}')
+        
+        # Always start background workers for API mode (not just in production)
+        # This ensures campaign polling works regardless of IS_PRODUCTION flag
+        start_background_workers()
         
         # Check for pending campaigns and auto-start if any exist
-        # Only run this in the main process (not in Flask's reloader)
-        if os.environ.get('WERKZEUG_RUN_MAIN') == 'true':
-            # Start background polling worker for auto-detection
-            start_background_workers()
-            
-            try:
-                pending = get_next_campaigns()
-                if pending:
-                    print(f'[AUTO-START] Found {len(pending)} pending campaign(s), starting automation...')
-                    # Start automation in background thread automatically
-                    thread = threading.Thread(target=run_automation_in_thread, daemon=True)
-                    thread.start()
-                else:
-                    print('[INFO] No pending campaigns found. Polling worker will auto-detect new campaigns...')
-            except Exception as e:
-                print(f'[WARN] Could not check for pending campaigns: {e}')
+        try:
+            pending = get_next_campaigns()
+            if pending:
+                print(f'[AUTO-START] Found {len(pending)} pending campaign(s), starting automation...')
+                # Start automation in background thread automatically
+                thread = threading.Thread(target=run_automation_in_thread, daemon=True)
+                thread.start()
+            else:
+                print('[INFO] No pending campaigns found. Polling worker will auto-detect new campaigns...')
+        except Exception as e:
+            print(f'[WARN] Could not check for pending campaigns: {e}')
         
-        app.run(debug=True, host='0.0.0.0', port=PORT, threaded=True)
+        # Use production-appropriate server settings
+        if IS_PRODUCTION:
+            # Production: use Waitress (Windows-compatible WSGI server)
+            try:
+                from waitress import serve
+                print(f'[SERVER] Running with Waitress on 0.0.0.0:{PORT}')
+                print(f'[SERVER] Production mode - debug disabled, 8 worker threads')
+                serve(app, host='0.0.0.0', port=PORT, threads=8)
+            except ImportError:
+                print('[WARN] Waitress not installed, falling back to Flask dev server')
+                print('[WARN] Install waitress for production: pip install waitress')
+                app.run(debug=False, host='0.0.0.0', port=PORT, threaded=True)
+        else:
+            # Development: enable debug with Flask dev server
+            print(f'[SERVER] Development mode - debug enabled')
+            app.run(debug=True, host='0.0.0.0', port=PORT, threaded=True)
     else:
         # Run automation directly
-        print('Running automation directly (use "python instagramApp.py api" for API server)')
+        print('Running automation directly (use "python app.py api" for API server)')
         asyncio.run(run_automation_with_dolphin_anty())
