@@ -28,6 +28,7 @@ from datetime import datetime
 from typing import Optional, Callable
 
 from playwright.async_api import Page, ElementHandle
+from media_manager import delete_local_media_file
 
 
 # ===========================================
@@ -570,6 +571,15 @@ class TwitterAutomation:
                     self.progress.warning('Phone verification modal detected')
                     return True
             
+            # Check 4: Email verification required
+            try:
+                page_text = await page.inner_text('body')
+                if 'Please verify your email address' in page_text:
+                    self.progress.warning('Email verification required detected')
+                    return True
+            except Exception:
+                pass
+            
             # If none of the above, assume account is OK
             return False
             
@@ -842,7 +852,8 @@ class TwitterAutomation:
         target_user: str, 
         logger, 
         max_posts: int = None,
-        **kwargs  # Accept but ignore legacy parameters
+        date_threshold: datetime = None,
+        **kwargs  # Accept but ignore any other legacy parameters
     ) -> list:
         """
         Get tweet links from a user's profile using regex-based DOM extraction.
@@ -855,22 +866,32 @@ class TwitterAutomation:
         - Stores in memory as (URL, datetime) tuples for computation/filtering
         - Skips entries without a matching timestamp
         - Continuously scrolls and extracts
+        - When date_threshold is set, stops early after CONSECUTIVE_OLD_POSTS_LIMIT
+          consecutive tweets older than the threshold and returns only eligible URLs
         
         Args:
             page: Playwright page object
             target_user: X/Twitter username
             logger: AutomationLogger instance
-            max_posts: Optional limit on posts to collect (None = unlimited)
-            **kwargs: Ignored legacy parameters (start_date, end_date, etc.)
+            max_posts: Optional limit on eligible posts to collect (None = unlimited)
+            date_threshold: Only return tweets posted on or after this datetime.
+                            Also used for early-stop scrolling logic.
+            **kwargs: Ignored legacy parameters
             
         Returns:
-            List of base tweet URLs (https://x.com/user/status/<id>)
+            List of eligible base tweet URLs (https://x.com/user/status/<id>)
         """
         # Create the regex-based extractor
         extractor = TweetLinkExtractor(target_user)
         
         scroll_count = 0
         SCROLL_WAIT_TIME = 1.5
+        consecutive_old_count = 0  # tracks consecutive tweets older than date_threshold
+        
+        # Normalize date_threshold to naive UTC so it can be compared with
+        # parse_timestamp() output (which always returns naive UTC datetimes)
+        if date_threshold is not None and date_threshold.tzinfo is not None:
+            date_threshold = date_threshold.replace(tzinfo=None)
         
         try:
             # Navigate to user's profile
@@ -887,6 +908,15 @@ class TwitterAutomation:
             initial_entries = await extractor.extract_from_page(page)
             self.progress.info(f'Initial scan: {len(initial_entries)} tweet links found', significant=False)
             
+            # Update consecutive old count based on initial entries
+            if date_threshold is not None:
+                for url, dt_str in initial_entries:
+                    tweet_date = self.parse_timestamp(dt_str)
+                    if tweet_date and tweet_date < date_threshold:
+                        consecutive_old_count += 1
+                    else:
+                        consecutive_old_count = 0
+            
             # Continuous scroll and extract loop
             while True:
                 # Check abort signal
@@ -894,10 +924,26 @@ class TwitterAutomation:
                     self.progress.warning('Tweet extraction aborted')
                     break
                 
-                # Check if we've hit max_posts limit
-                if max_posts is not None and extractor.get_collected_count() >= max_posts:
-                    self.progress.info(f'Reached target of {max_posts} tweets', significant=True)
+                # Early stop: scrolled well past the date threshold
+                if date_threshold is not None and consecutive_old_count >= self.CONSECUTIVE_OLD_POSTS_LIMIT:
+                    self.progress.info(
+                        f'Reached date threshold after {consecutive_old_count} consecutive old tweets — stopping scroll',
+                        significant=True
+                    )
                     break
+                
+                # Check if we've hit max_posts limit (count against eligible tweets only)
+                if max_posts is not None:
+                    eligible_so_far = [
+                        url for url, dt_str in extractor.get_collected_with_timestamps()
+                        if date_threshold is None or (
+                            self.parse_timestamp(dt_str) is not None and
+                            self.parse_timestamp(dt_str) >= date_threshold
+                        )
+                    ]
+                    if len(eligible_so_far) >= max_posts:
+                        self.progress.info(f'Reached target of {max_posts} eligible tweets', significant=True)
+                        break
                 
                 scroll_count += 1
                 
@@ -912,16 +958,49 @@ class TwitterAutomation:
                     self.progress.info(f'Scroll {scroll_count}: Found {len(new_entries)} new links (Total: {extractor.get_collected_count()})', significant=False)
                     for entry in new_entries:
                         logger.log_post_found()
+                    
+                    # Update consecutive old count for early-stop
+                    if date_threshold is not None:
+                        for url, dt_str in new_entries:
+                            tweet_date = self.parse_timestamp(dt_str)
+                            if tweet_date and tweet_date < date_threshold:
+                                consecutive_old_count += 1
+                            else:
+                                consecutive_old_count = 0  # reset on any eligible tweet
             
-            # Summary
-            total_collected = extractor.get_collected_count()
-            self.progress.success(f'Extracted {total_collected} tweet links for @{target_user}')
-            
-            return extractor.get_all_collected()
+            # Apply date filter: keep only tweets on or after date_threshold
+            all_data = extractor.get_collected_with_timestamps()
+            if date_threshold is not None:
+                eligible_urls = [
+                    url for url, dt_str in all_data
+                    if (
+                        self.parse_timestamp(dt_str) is not None and
+                        self.parse_timestamp(dt_str) >= date_threshold
+                    )
+                ]
+                self.progress.success(
+                    f'Extraction complete: {len(eligible_urls)} eligible tweets '
+                    f'(of {extractor.get_collected_count()} total) for @{target_user}'
+                )
+                return eligible_urls
+            else:
+                total_collected = extractor.get_collected_count()
+                self.progress.success(f'Extracted {total_collected} tweet links for @{target_user}')
+                return extractor.get_all_collected()
             
         except Exception as e:
             self.progress.target_failed(target_user, f'Unable to access profile: {str(e)[:50]}')
             print(f'[ERROR] Tweet extraction failed: {e}')
+            # Still apply date filter on whatever was collected
+            all_data = extractor.get_collected_with_timestamps()
+            if date_threshold is not None:
+                return [
+                    url for url, dt_str in all_data
+                    if (
+                        self.parse_timestamp(dt_str) is not None and
+                        self.parse_timestamp(dt_str) >= date_threshold
+                    )
+                ]
             return extractor.get_all_collected()
     
     async def run_continuous_tweet_extraction(
@@ -1553,7 +1632,7 @@ class TwitterAutomation:
         except Exception:
             return True  # Fail open - assume posted
     
-    async def reply_to_tweet(self, page: Page, reply_text: str, logger) -> bool:
+    async def reply_to_tweet(self, page: Page, reply_text: str, logger, local_media_paths: list = None) -> bool:
         """
         Post a reply to the current tweet using accessible DOM selectors.
         
@@ -1574,6 +1653,8 @@ class TwitterAutomation:
         Returns:
             True if reply was posted successfully, False otherwise
         """
+        local_media_paths = local_media_paths or []
+
         # Step 1: Ensure we're on a single tweet page
         if not await self._is_single_tweet_page(page):
             self.progress.warning('Not on a single tweet page - cannot reply')
@@ -1625,10 +1706,16 @@ class TwitterAutomation:
                 await self.human_like_click(page, reply_input, logger)
                 await asyncio.sleep(self.get_random_delay(0.3, 0.7))
                 
+                # Branch: if media is attached, delegate to media-aware submission
+                if local_media_paths:
+                    return await self._post_reply_with_media(
+                        page, reply_input, reply_text, local_media_paths, logger
+                    )
+
                 # Stream the reply text character-by-character with human-like delays
                 self.progress.info('Typing reply', significant=False)
                 await stream_type_text(reply_input, reply_text)
-                
+
                 # Review pause after typing
                 await self.do_review_pause(logger)
                 
@@ -1679,6 +1766,24 @@ class TwitterAutomation:
                     await asyncio.sleep(0.5)
                     await page.keyboard.press('Control+Enter')  # Windows/Linux
                     await asyncio.sleep(2)
+
+                # Dismiss any overlay that Twitter shows after the Reply click,
+                # then re-click the button if an overlay was present.
+                overlay_dismissed = await self._dismiss_post_overlay(page)
+                if overlay_dismissed:
+                    self.progress.info('Re-clicking Reply button after overlay dismissed', significant=False)
+                    reply_button_retry = await self._locate_reply_button_scoped(page)
+                    if not reply_button_retry:
+                        for btn_selector in ['[data-testid="tweetButton"]', 'button:has-text("Reply")', 'button:has-text("Post")']:
+                            try:
+                                reply_button_retry = await page.wait_for_selector(btn_selector, timeout=3000)
+                                if reply_button_retry:
+                                    break
+                            except Exception:
+                                continue
+                    if reply_button_retry:
+                        await self._click_reply_button(page, reply_button_retry)
+                        await asyncio.sleep(2)
                 
                 # Step 7: Verify reply was posted
                 await asyncio.sleep(1.5)
@@ -1698,7 +1803,522 @@ class TwitterAutomation:
         
         self.progress.error(f'Could not post reply after {self.MAX_COMMENT_RETRIES} attempts')
         return False
-    
+
+    async def _dismiss_post_overlay(self, page: Page) -> bool:
+        """
+        Detect and dismiss any dialog/overlay that Twitter shows after the Reply
+        button is clicked (e.g. a login prompt, sensitive-content warning, or
+        composer dialog that appears on top of the tweet thread).
+
+        Strategy:
+          1. Wait up to 2 s for a div[role="dialog"] to appear.
+          2. Get the dialog's bounding box.
+          3. Click at a point clearly outside the dialog (mimicking the user
+             clicking on the page backdrop to close it).
+          4. Wait briefly for the overlay to close.
+
+        Returns True if an overlay was found and dismissed, False otherwise.
+        """
+        self.progress.info('Checking for post-submission overlay', significant=False)
+        try:
+            dialog = await page.wait_for_selector('div[role="dialog"]', timeout=random.randint(10000, 15000))
+            self.progress.info('Overlay detected after Reply click — clicking outside to dismiss', significant=False)
+
+            # Find a point on the page that is guaranteed to be outside the dialog.
+            # Prefer the top-left corner of the viewport; if the dialog happens to
+            # cover that area, fall back to the bottom-right corner.
+            click_x, click_y = 10, 10
+            try:
+                box = await dialog.bounding_box()
+                viewport = page.viewport_size or {'width': 1280, 'height': 800}
+                if box:
+                    # Try above the dialog
+                    if box['y'] > 60:
+                        click_x = viewport['width'] // 2
+                        click_y = max(10, int(box['y']) - 30)
+                    # Try below the dialog
+                    elif box['y'] + box['height'] < viewport['height'] - 60:
+                        click_x = viewport['width'] // 2
+                        click_y = int(box['y'] + box['height']) + 30
+                    # Try to the left of the dialog
+                    elif box['x'] > 60:
+                        click_x = max(10, int(box['x']) - 30)
+                        click_y = viewport['height'] // 2
+                    # Last resort: bottom-right corner
+                    else:
+                        click_x = viewport['width'] - 10
+                        click_y = viewport['height'] - 10
+            except Exception:
+                pass  # keep default (10, 10)
+
+            self.progress.info(
+                f'Clicking outside overlay at ({click_x}, {click_y})',
+                significant=False,
+            )
+            await page.mouse.click(click_x, click_y)
+            await asyncio.sleep(1.0)  # wait for overlay to close
+            return True
+        except Exception:
+            # No overlay appeared within the timeout — good, nothing to dismiss
+            return False
+
+    async def _dismiss_post_overlay_now(self, page: Page, dialog_el) -> None:
+        """
+        Given an already-found dialog element, click a point on the page that is
+        clearly outside it (mimicking the user clicking the backdrop to close it).
+
+        This is a fire-and-forget helper — callers are responsible for waiting
+        and checking whether the dialog closed.
+        """
+        click_x, click_y = 10, 10
+        try:
+            box = await dialog_el.bounding_box()
+            viewport = page.viewport_size or {'width': 1280, 'height': 800}
+            if box:
+                if box['y'] > 60:
+                    click_x = viewport['width'] // 2
+                    click_y = max(10, int(box['y']) - 30)
+                elif box['y'] + box['height'] < viewport['height'] - 60:
+                    click_x = viewport['width'] // 2
+                    click_y = int(box['y'] + box['height']) + 30
+                elif box['x'] > 60:
+                    click_x = max(10, int(box['x']) - 30)
+                    click_y = viewport['height'] // 2
+                else:
+                    click_x = viewport['width'] - 10
+                    click_y = viewport['height'] - 10
+        except Exception:
+            pass
+
+        self.progress.info(
+            f'[MEDIA] Clicking outside dialog at ({click_x}, {click_y})',
+            significant=False,
+        )
+        try:
+            await page.mouse.click(click_x, click_y)
+        except Exception:
+            pass
+
+    async def _dismiss_done_overlay(self, page: Page) -> bool:
+        """
+        Find and click Twitter's "Done" button that appears in the media-editor
+        overlay after attaching images to a reply.
+
+        Strategy: poll the DOM via JavaScript for up to ~4 seconds, checking
+        both known data-testid values and any visible button whose trimmed text
+        is exactly "Done".  Using JS evaluation is more reliable than CSS/Playwright
+        extended selectors because it works regardless of how Twitter names the
+        element internally.
+
+        Returns True if the button was found and clicked, False if it was not
+        visible within the polling window (caller should continue normally).
+        """
+        self.progress.info('Checking for media-editor "Done" overlay', significant=False)
+
+        # JavaScript that finds the Done button by data-testid OR by visible text.
+        # Returns the element if found, null otherwise.
+        find_done_js = """
+        () => {
+            // 1. Try known data-testid values first (fastest path).
+            const byTestId = document.querySelector(
+                '[data-testid="tweetPhoto_Done_Button"], ' +
+                '[data-testid="Done_Button"], ' +
+                '[data-testid*="done_button"], ' +
+                '[data-testid*="DoneButton"]'
+            );
+            if (byTestId) return byTestId;
+
+            // 2. Scan every visible button / role=button element by text.
+            const candidates = Array.from(
+                document.querySelectorAll('button, [role="button"]')
+            );
+            return candidates.find(el => {
+                const text = (el.innerText || el.textContent || '').trim();
+                // Accept exact "Done" (case-insensitive).
+                return text.toLowerCase() === 'done' && el.offsetParent !== null;
+            }) || null;
+        }
+        """
+
+        max_polls = 8          # 8 × 0.5 s = 4 s total window
+        for attempt in range(max_polls):
+            try:
+                handle = await page.evaluate_handle(find_done_js)
+                el = handle.as_element()
+                if el:
+                    self.progress.info(
+                        f'Found "Done" overlay button (attempt {attempt + 1}) — clicking',
+                        significant=False,
+                    )
+                    # Click via Playwright (dispatches real events).
+                    try:
+                        await el.click()
+                    except Exception:
+                        # If the element handle is stale, fall back to a JS click.
+                        await page.evaluate("""
+                        () => {
+                            const btn = document.querySelector(
+                                '[data-testid="tweetPhoto_Done_Button"], ' +
+                                '[data-testid="Done_Button"]'
+                            ) || Array.from(
+                                document.querySelectorAll('button, [role="button"]')
+                            ).find(e => (e.innerText || '').trim().toLowerCase() === 'done');
+                            if (btn) btn.click();
+                        }
+                        """)
+                    await asyncio.sleep(0.5)   # let overlay close
+                    await handle.dispose()
+                    return True
+                await handle.dispose()
+            except Exception:
+                pass
+            await asyncio.sleep(0.5)
+
+        self.progress.info(
+            '"Done" overlay not detected — continuing without dismissal',
+            significant=False,
+        )
+        return False
+
+    async def _mouse_move_and_click_reply(self, page: Page, reply_button, logger) -> bool:
+        """
+        Click the Reply button by moving the physical mouse cursor to the
+        button's on-screen coordinates and firing a mouse click at that position.
+
+        This is intentionally coordinate-based (page.mouse.move + page.mouse.click)
+        rather than a Playwright DOM dispatch so that Twitter's bot-detection layer
+        sees a genuine pointer event arriving from outside the element.
+
+        Steps:
+          1. Get the button's bounding box.
+          2. Pick a random point within the inner 40–60 % of the button face.
+          3. Delegate to self.human_like_click (bezier move → page.mouse.click).
+          4. Falls back to _click_reply_button if the bounding box is unavailable.
+
+        Args:
+            page:         Playwright page object.
+            reply_button: Playwright ElementHandle or Locator for the button.
+            logger:       AutomationLogger instance passed through to human_like_click.
+
+        Returns:
+            True if the click was dispatched, False on total failure.
+        """
+        try:
+            box = await reply_button.bounding_box()
+            if not box:
+                self.progress.warning('[MEDIA] Reply button bounding box unavailable — falling back to DOM click')
+                return await self._click_reply_button(page, reply_button)
+
+            # Random point within 30–70 % of the button area (avoids edges)
+            import random as _random
+            target_x = box['x'] + box['width'] * _random.uniform(0.3, 0.7)
+            target_y = box['y'] + box['height'] * _random.uniform(0.3, 0.7)
+
+            self.progress.info(
+                f'Moving cursor to Reply button at ({int(target_x)}, {int(target_y)})',
+                significant=False,
+            )
+
+            if self.human_like_click:
+                # human_like_click already performs bezier move then page.mouse.click
+                await self.human_like_click(page, reply_button, logger)
+            else:
+                # Direct coordinate click as fallback
+                await page.mouse.move(target_x, target_y)
+                await asyncio.sleep(self.get_random_delay(0.1, 0.3))
+                await page.mouse.click(target_x, target_y)
+
+            return True
+
+        except Exception as e:
+            self.progress.warning(f'[MEDIA] Cursor-click failed ({str(e)[:60]}) — falling back to DOM click')
+            return await self._click_reply_button(page, reply_button)
+
+    async def _post_reply_with_media(
+        self,
+        page: Page,
+        reply_input: ElementHandle,
+        comment_text: str,
+        local_media_paths: list,
+        logger,
+    ) -> bool:
+        """
+        Post a reply that includes one or more image attachments.
+
+        Called only when local_media_paths is non-empty. Handles:
+          1. Optionally typing comment text (skipped when empty/None).
+          2. Attaching files via the hidden <input type="file"> element
+             (never clicks the visible toolbar button — not compatible with
+             headless/VPS environments).
+          3. Waiting for Twitter's media preview and upload completion.
+          4. Re-querying the reply button fresh (layout shifts after upload).
+          5. Clicking the reply button.
+
+        Tier 1 cleanup (delete_local_media_file) always runs in finally,
+        regardless of success or failure.
+
+        Args:
+            page:             Playwright page (on a tweet detail page).
+            reply_input:      The already-focused reply composer textarea.
+            comment_text:     Optional text to type alongside the media.
+            local_media_paths: List of absolute local file path strings.
+            logger:           AutomationLogger instance.
+
+        Returns:
+            True if the reply was submitted, False on any failure.
+        """
+        # Step 1: Type comment text if provided
+        if comment_text and comment_text.strip():
+            self.progress.info('Typing reply text', significant=False)
+            await stream_type_text(reply_input, comment_text)
+
+        # Step 2: Locate the hidden <input type="file"> for media attachment.
+        # Twitter renders a hidden file input inside the composer.
+        # We must NOT click the visible toolbar button (opens OS picker).
+        file_input_selectors = [
+            'input[type="file"][data-testid]',
+            'input[type="file"][accept*="image"]',
+            'input[type="file"][accept]',
+            'form input[type="file"]',
+        ]
+        file_input = None
+        for selector in file_input_selectors:
+            try:
+                file_input = await page.wait_for_selector(selector, timeout=2000)
+                if file_input:
+                    self.progress.info(
+                        f'Found file input with selector: {selector}',
+                        significant=False,
+                    )
+                    break
+            except Exception:
+                continue
+
+        if not file_input:
+            self.progress.warning(
+                '[MEDIA] Could not locate hidden file input in reply composer — '
+                'cannot attach media.'
+            )
+            return False
+
+        # Step 3: Attach files via set_input_files (no OS dialog, VPS-safe)
+        self.progress.info(
+            f'Attaching {len(local_media_paths)} file(s) via file input',
+            significant=False,
+        )
+        await file_input.set_input_files(local_media_paths)
+
+        # Step 3b: Twitter sometimes immediately opens a media-editor overlay
+        # (with a "Done" button) the moment files are attached — dismiss it
+        # before we even wait for the preview card.
+        await self._dismiss_done_overlay(page)
+
+        # Step 4: Wait for Twitter to render the media preview card
+        self.progress.info('Waiting for media preview to render', significant=False)
+        media_preview_appeared = False
+        try:
+            await page.wait_for_selector(
+                '[data-testid="attachments"]',
+                timeout=15000,
+            )
+            media_preview_appeared = True
+        except Exception:
+            self.progress.warning(
+                '[MEDIA] Media preview did not appear within 15s — '
+                'upload likely succeeded anyway; proceeding to submit.'
+            )
+
+        # Step 5: Wait for upload progress spinner to disappear
+        # Only wait if we saw the preview, otherwise skip (upload may still
+        # be in-flight but we'll give it a flat extra delay instead).
+        self.progress.info('Waiting for media upload to complete', significant=False)
+        if media_preview_appeared:
+            try:
+                await page.wait_for_selector(
+                    '[data-testid="attachments"] [role="progressbar"]',
+                    state='detached',
+                    timeout=90000,
+                )
+            except Exception:
+                self.progress.warning(
+                    '[MEDIA] Upload spinner did not disappear within 90s — proceeding anyway.'
+                )
+        else:
+            # Give Twitter a generous flat wait to finish processing the file
+            # even when the preview card did not render.
+            await asyncio.sleep(5)
+
+        # Step 6: Dismiss the "Done" overlay a second time in case it re-appeared
+        # after the upload spinner cleared (e.g. alt-text prompt).
+        await self._dismiss_done_overlay(page)
+
+        # Step 6b: Brief pause before clicking Reply.
+        await asyncio.sleep(self.get_random_delay(0.2, 0.5))
+
+        # Step 7: Locate and click the Post/Reply button.
+        #
+        # After media upload Twitter may have promoted the composer into a
+        # div[role="dialog"] (the full media-reply modal).  In that case the
+        # existing _locate_reply_button_scoped — which deliberately skips
+        # dialog elements — will find nothing, and the dialog just persists.
+        #
+        # Strategy:
+        #   a. Check if a dialog is already open RIGHT NOW (before clicking).
+        #   b. If yes → locate tweetButton INSIDE the dialog and click it.
+        #      That is the actual submission path for Twitter media replies.
+        #   c. If the dialog has no recognisable submit button → click OUTSIDE
+        #      the dialog to dismiss it, then fall through to the normal flow.
+        #   d. If no dialog → use the normal scoped button lookup.
+        #   e. After clicking (any path), check whether yet another overlay
+        #      appeared and handle it the same way.
+
+        self.progress.info('Re-querying Reply button after media upload', significant=False)
+
+        async def _find_and_click_reply_button() -> bool:
+            """Inner helper: locate the correct Post button and click it.
+
+            Handles Twitter's "Replying to" audience-selector dialog that
+            appears after media upload.  That dialog contains only a "Done"
+            button (blue, top-right).  Clicking "Done" dismisses the dialog;
+            after dismissal the normal reply composer is active and we click
+            its Post/Reply button.
+            """
+
+            # --- Check for an open dialog right now ---
+            try:
+                dialog_el = await page.query_selector('div[role="dialog"]')
+            except Exception:
+                dialog_el = None
+
+            if dialog_el and await dialog_el.is_visible():
+                self.progress.info(
+                    '[MEDIA] Dialog open — checking for "Done" / Post button inside',
+                    significant=False,
+                )
+
+                # First priority: "Done" button (Twitter's "Replying to" audience dialog).
+                # Clicking it closes the dialog; we then click the real Post button.
+                done_btn = None
+                for done_sel in [
+                    '[data-testid="tweetPhoto_Done_Button"]',
+                    '[data-testid="Done_Button"]',
+                    'button:has-text("Done")',
+                    '[role="button"]:has-text("Done")',
+                ]:
+                    try:
+                        candidate = await dialog_el.query_selector(done_sel)
+                        if candidate and await candidate.is_visible():
+                            done_btn = candidate
+                            break
+                    except Exception:
+                        continue
+
+                if done_btn:
+                    self.progress.info(
+                        '[MEDIA] "Done" button found in dialog — clicking to dismiss audience selector',
+                        significant=False,
+                    )
+                    await self._mouse_move_and_click_reply(page, done_btn, logger)
+                    # Wait for the dialog to close before looking for the Post button
+                    try:
+                        await page.wait_for_selector(
+                            'div[role="dialog"]', state='hidden', timeout=5000
+                        )
+                    except Exception:
+                        await asyncio.sleep(1.5)
+                    self.progress.info(
+                        '[MEDIA] Audience dialog closed — now clicking Post button',
+                        significant=False,
+                    )
+                    # Fall through to the normal path below to click Post
+
+                else:
+                    # Dialog has no "Done" button — look for a direct submit button inside it
+                    dialog_btn = None
+                    for sel in [
+                        '[data-testid="tweetButton"]',
+                        '[data-testid="tweetButtonInline"]',
+                        'button:has-text("Post")',
+                        'button:has-text("Reply")',
+                    ]:
+                        try:
+                            candidate = await dialog_el.query_selector(sel)
+                            if candidate and await candidate.is_visible():
+                                dialog_btn = candidate
+                                break
+                        except Exception:
+                            continue
+
+                    if dialog_btn:
+                        self.progress.info(
+                            '[MEDIA] Found Post button inside dialog — clicking via cursor',
+                            significant=False,
+                        )
+                        await self._mouse_move_and_click_reply(page, dialog_btn, logger)
+                        return True
+
+                    # Dialog has nothing useful — click outside to dismiss
+                    self.progress.info(
+                        '[MEDIA] Dialog has no recognisable button — clicking outside to dismiss',
+                        significant=False,
+                    )
+                    await self._dismiss_post_overlay_now(page, dialog_el)
+                    await asyncio.sleep(1.0)
+
+            # --- Normal path: look for Post/Reply button outside any dialog ---
+            reply_button = await self._locate_reply_button_scoped(page)
+            if not reply_button:
+                for btn_selector in [
+                    '[data-testid="tweetButton"]',
+                    '[data-testid="tweetButtonInline"]',
+                    'button:has-text("Reply")',
+                    'button:has-text("Post")',
+                ]:
+                    try:
+                        reply_button = await page.wait_for_selector(btn_selector, timeout=3000)
+                        if reply_button:
+                            break
+                    except Exception:
+                        continue
+
+            if not reply_button:
+                self.progress.warning('[MEDIA] Reply button not found.')
+                return False
+
+            self.progress.info(
+                'Moving cursor to Reply button and clicking (with media)',
+                significant=False,
+            )
+            await self._mouse_move_and_click_reply(page, reply_button, logger)
+            return True
+
+        # First click attempt
+        clicked = await _find_and_click_reply_button()
+        if not clicked:
+            return False
+
+        # Step 8: After clicking, check whether YET ANOTHER overlay appeared
+        # (e.g. a confirmation prompt on top of the composer).  If so, dismiss
+        # it by clicking outside and re-click the button one final time.
+        await asyncio.sleep(1.5)
+        try:
+            second_dialog = await page.query_selector('div[role="dialog"]')
+        except Exception:
+            second_dialog = None
+
+        if second_dialog and await second_dialog.is_visible():
+            self.progress.info(
+                '[MEDIA] Second overlay appeared — dismissing and re-clicking',
+                significant=False,
+            )
+            await self._dismiss_post_overlay_now(page, second_dialog)
+            await asyncio.sleep(1.0)
+            await _find_and_click_reply_button()
+            await asyncio.sleep(1.5)
+
+        self.progress.info('Reply with media submitted.', significant=True)
+        return True
+
     async def type_reply_with_streaming(
         self,
         page: Page,
@@ -1894,11 +2514,13 @@ class TwitterAutomation:
         post_count: int,
         comment_text: str,
         logger,
-        post_delay: float = None
+        post_delay: float = None,
+        local_media_paths: list = None,
     ) -> dict:
         """
         Process a fixed number of tweets from a user (newest first).
         """
+        local_media_paths = local_media_paths or []
         result = {
             "success": True,
             "posts_found": 0,
@@ -1943,25 +2565,25 @@ class TwitterAutomation:
                     self.progress.info(f'Tweet from {post_date.strftime("%b %d")}', significant=False)
                 
                 self.progress.commenting_on_post(i + 1, len(tweets_to_process), target_user)
-                replied = await self.reply_to_tweet(page, comment_text, logger)
+                replied = await self.reply_to_tweet(page, comment_text, logger, local_media_paths=local_media_paths)
                 if replied:
                     result["posts_commented"] += 1
                     self.progress.comment_posted(target_user, result["posts_commented"], len(tweets_to_process))
                 else:
                     self.progress.comment_failed(target_user, i + 1, len(tweets_to_process), "Could not submit reply")
-                
+
                 logger.log_post_processed(commented=replied)
                 result["posts_processed"] += 1
-                
+
                 await self.do_post_to_post_delay(post_delay, logger)
-                
+
             except Exception as e:
                 error_msg = f'Error processing tweet {tweet_url}: {e}'
                 self.progress.error(f'Tweet processing failed: {str(e)[:50]}')
                 result["errors"].append(error_msg)
-        
+
         return result
-    
+
     async def process_posts_after_date(
         self,
         page: Page,
@@ -1969,11 +2591,13 @@ class TwitterAutomation:
         date_threshold: datetime,
         comment_text: str,
         logger,
-        post_delay: float = None
+        post_delay: float = None,
+        local_media_paths: list = None,
     ) -> dict:
         """
         Process tweets from a user posted after the given date.
         """
+        local_media_paths = local_media_paths or []
         result = {
             "success": True,
             "posts_found": 0,
@@ -1983,15 +2607,15 @@ class TwitterAutomation:
             "stopped_early": False,
             "errors": []
         }
-        
+
         self.progress.scanning_posts(target_user)
-        
+
         tweet_links = await self.get_tweet_links_from_profile(
             page=page,
             target_user=target_user,
             logger=logger,
             max_posts=100,
-            start_date=date_threshold
+            date_threshold=date_threshold
         )
         result["posts_found"] = len(tweet_links)
         
@@ -2017,7 +2641,7 @@ class TwitterAutomation:
                     self.progress.info(f'Tweet from {post_date.strftime("%b %d")}', significant=False)
                 
                 self.progress.commenting_on_post(i + 1, len(tweet_links), target_user)
-                replied = await self.reply_to_tweet(page, comment_text, logger)
+                replied = await self.reply_to_tweet(page, comment_text, logger, local_media_paths=local_media_paths)
                 if replied:
                     result["posts_commented"] += 1
                     self.progress.comment_posted(target_user, result["posts_commented"], len(tweet_links))

@@ -20,8 +20,17 @@ from flask_cors import CORS
 from flasgger import Swagger, swag_from
 from twitter import TwitterAutomation, TwitterSelectors, TweetReplyResult, stream_type_text
 from instagram import InstagramAutomation, InstagramSelectors
+from threads import ThreadsAutomation, ThreadsSelectors
+from media_manager import (
+    init_media_manager,
+    verify_media_exists_in_storage,
+    download_campaign_media,
+    delete_local_campaign_dir,
+    delete_campaign_media_from_storage,
+)
 
 dotenv.load_dotenv()
+init_media_manager()
 
 # ===========================================
 # ENVIRONMENT CONFIGURATION
@@ -46,6 +55,7 @@ ALLOWED_ORIGINS = os.environ.get('ALLOWED_ORIGINS', '*').split(',')
 # ===========================================
 # FLASK API SETUP
 # ===========================================
+
 
 app = Flask(__name__)
 
@@ -327,6 +337,7 @@ class ProgressEmitter:
     
     def campaign_aborted(self):
         """Checkpoint: Campaign was aborted by user"""
+        event_store.set_status('aborted')
         event_store.add_checkpoint(
             event_type='campaign',
             status='failure',
@@ -560,7 +571,7 @@ def index():
     """
     return jsonify({
         'message': 'Social Media Comment Bot API by AIVS',
-        'version': '2.0.0 - Twitter Support',
+        'version': '4.0.0 - Twitter image Support',
         'status': 'running'
     })
 
@@ -614,7 +625,6 @@ def health_check():
         'service': 'social-media-comment-bot',
         'environment': 'production' if IS_PRODUCTION else 'development',
         'automation_status': event_store.status,
-        'workers_started': _workers_started,
         'dependencies': {
             'dolphin_anty': dolphin_status,
             'supabase': supabase_status
@@ -934,8 +944,8 @@ def get_checkpoints():
     })
 
 
-def run_automation_in_thread():
-    """Run automation in background thread"""
+def run_automation_in_thread(campaign_id: str = None):
+    """Run automation in background thread for a specific campaign."""
     try:
         event_store.clear()
         event_store.set_status('running')
@@ -943,8 +953,8 @@ def run_automation_in_thread():
         # Emit campaign starting checkpoint
         progress.campaign_starting()
         
-        # Run the async automation
-        asyncio.run(run_automation_with_dolphin_anty())
+        # Run the async automation for the specified campaign
+        asyncio.run(run_automation_with_dolphin_anty(campaign_id=campaign_id))
         
         # Check if aborted
         if event_store.is_aborted():
@@ -986,13 +996,24 @@ def start_automation():
     if event_store.status == 'running':
         return jsonify({'error': 'Automation already running'}), 400
     
-    # Start automation in background thread
-    thread = threading.Thread(target=run_automation_in_thread, daemon=True)
+    # Read the campaign_id from the request body
+    data = request.get_json(silent=True) or {}
+    campaign_id = data.get('campaign_id')
+    
+    if not campaign_id:
+        return jsonify({'error': 'campaign_id is required'}), 400
+    
+    # Start automation in background thread for the specific campaign
+    thread = threading.Thread(
+        target=run_automation_in_thread,
+        args=(campaign_id,),
+        daemon=True,
+    )
     thread.start()
     
     return jsonify({
         'status': 'started',
-        'message': 'Automation started successfully'
+        'message': f'Campaign {campaign_id} started successfully'
     })
 
 
@@ -1133,33 +1154,12 @@ def campaign_added_webhook():
         print(f'[WEBHOOK] Campaign ID: {record.get("campaign_id")}')
         print(f'[WEBHOOK] Status: {record.get("status")}')
         
-        # Only process INSERT events for not-started campaigns
-        if webhook_type == 'INSERT' and record.get('status') == 'not-started':
-            # Check if automation is already running
-            if event_store.status == 'running':
-                print('[WEBHOOK] Automation already running, new campaign will be picked up in queue')
-                return jsonify({
-                    'status': 'received',
-                    'automation_started': False,
-                    'message': 'Campaign queued, automation already running'
-                })
-            
-            # Start automation for new campaign
-            print('[WEBHOOK] Starting automation for new campaign...')
-            thread = threading.Thread(target=run_automation_in_thread, daemon=True)
-            thread.start()
-            
-            return jsonify({
-                'status': 'received',
-                'automation_started': True,
-                'message': 'Automation started for new campaign'
-            })
-        
-        # Acknowledge other webhook types
+        # Acknowledge all webhook events - automation is started manually via /api/start
+        print('[WEBHOOK] Acknowledged. Automation must be started manually via /api/start.')
         return jsonify({
             'status': 'received',
             'automation_started': False,
-            'message': f'Webhook processed: {webhook_type}'
+            'message': f'Webhook acknowledged: {webhook_type} — use /api/start to run automation'
         })
         
     except Exception as e:
@@ -2302,11 +2302,51 @@ def get_next_campaigns():
             print(f'[DB] Found {len(response.data)} pending campaign(s)')
             return response.data
         else:
-            print('[DB] No pending campaigns found')
+            # Only print if no automation is currently running (reduces log noise)
+            if event_store.status != 'running':
+                print('[DB] No pending campaigns found')
             return []
     
     except Exception as e:
         print(f'[ERR] Could not load campaigns from database: {e}')
+        return []
+
+
+def get_campaign_by_id(campaign_id: str):
+    """
+    Get a single campaign by its campaign_id.
+    
+    Only returns the campaign if its status is 'not-started' (guards against
+    double-runs).  Returns a single-item list so the caller's for-loop
+    requires zero changes.
+    
+    Args:
+        campaign_id: The campaign_id to look up.
+    
+    Returns:
+        Single-item list with the campaign dict, or empty list if not found
+        or not in 'not-started' status.
+    """
+    try:
+        supabase = get_supabase_client()
+        response = (
+            supabase.table('comment_campaigns')
+            .select('*')
+            .eq('campaign_id', campaign_id)
+            .eq('status', 'not-started')
+            .limit(1)
+            .execute()
+        )
+        
+        if response.data:
+            print(f'[DB] Found campaign {campaign_id} (status: not-started)')
+            return response.data
+        else:
+            print(f'[DB] Campaign {campaign_id} not found or not in not-started status')
+            return []
+    
+    except Exception as e:
+        print(f'[ERR] Could not load campaign {campaign_id} from database: {e}')
         return []
 
 
@@ -2369,13 +2409,63 @@ def deactivate_account(username: str, platform: str = 'instagram'):
     """
     try:
         supabase = get_supabase_client()
-        supabase.table('social_accounts').update({
+        
+        # Try both with and without @ symbol to handle different storage formats
+        clean_username = username.lstrip('@')
+        usernames_to_try = [clean_username, f'@{clean_username}']
+        
+        print(f'[DEBUG] Attempting to deactivate account: usernames={usernames_to_try}, platform={platform}')
+        
+        response = supabase.table('social_accounts').update({
             'is_active': False,
             'updated_at': datetime.now().isoformat()
-        }).eq('username', username).eq('platform', platform).execute()
-        print(f'[DB] Deactivated account @{username} on {platform}')
+        }).in_('username', usernames_to_try).eq('platform', platform).execute()
+        
+        if response.data and len(response.data) > 0:
+            updated_username = response.data[0].get('username', username)
+            print(f'[DB] ✓ Successfully deactivated account @{updated_username} on {platform}')
+        else:
+            print(f'[WARN] Deactivate query returned no data for @{username} on {platform}')
     except Exception as e:
         print(f'[ERR] Could not deactivate account @{username}: {e}')
+
+
+def reactivate_account(username: str, platform: str = 'instagram'):
+    """
+    Reactivate a social account after it successfully passes login/bot check.
+    
+    This is called when an inactive account successfully logs in,
+    indicating the account has been manually resolved.
+    
+    Args:
+        username: Account username
+        platform: Social media platform (default: 'instagram')
+    """
+    try:
+        supabase = get_supabase_client()
+        
+        # Try both with and without @ symbol to handle different storage formats
+        clean_username = username.lstrip('@')
+        usernames_to_try = [clean_username, f'@{clean_username}']
+        
+        print(f'[DEBUG] Attempting to reactivate account: usernames={usernames_to_try}, platform={platform}')
+        
+        # Update using IN clause to match either format
+        response = supabase.table('social_accounts').update({
+            'is_active': True,
+            'updated_at': datetime.now().isoformat()
+        }).in_('username', usernames_to_try).eq('platform', platform).execute()
+        
+        # Check if update was successful
+        if response.data and len(response.data) > 0:
+            updated_username = response.data[0].get('username', username)
+            print(f'[DB] ✓ Successfully reactivated account @{updated_username} on {platform}')
+            print(f'[DEBUG] Updated record: {response.data[0]}')
+        else:
+            print(f'[WARN] Reactivate query returned no data for @{username} on {platform}')
+            print(f'[DEBUG] Tried usernames: {usernames_to_try}')
+    except Exception as e:
+        print(f'[ERR] Could not reactivate account @{username}: {e}')
 
 
 def get_account_credentials(username: str, platform: str = 'instagram'):
@@ -2401,11 +2491,15 @@ def get_account_credentials(username: str, platform: str = 'instagram'):
         print(f'[DEBUG] Looking up credentials: usernames={usernames_to_try}, platform="{platform}"')
         
         # Try to find account with either username format
-        response = supabase.table('social_accounts').select('username,password,browser_profile').in_('username', usernames_to_try).eq('platform', platform).eq('is_active', True).limit(1).execute()
+        # Note: We don't filter by is_active here - inactive accounts should still be tried
+        # If the account encounters a roadblock during login, it will be skipped at that point
+        response = supabase.table('social_accounts').select('username,password,browser_profile,is_active').in_('username', usernames_to_try).eq('platform', platform).limit(1).execute()
         
         if response.data and len(response.data) > 0:
             found_username = response.data[0].get('username')
-            print(f'[DEBUG] ✓ Found credentials for "{found_username}" on {platform}')
+            is_active = response.data[0].get('is_active', True)
+            status_str = '✓' if is_active else '⚠️ (inactive)'
+            print(f'[DEBUG] {status_str} Found credentials for "{found_username}" on {platform}')
             return response.data[0]
         else:
             print(f'[WARN] No credentials found for {username} on {platform}')
@@ -2461,9 +2555,11 @@ def get_platform_browser_profiles(platform: str) -> list:
     """
     try:
         supabase = get_supabase_client()
+        # Note: We don't filter by is_active - inactive accounts should still be available
+        # The campaign will attempt to use them and skip if they encounter roadblocks
         response = supabase.table('social_accounts').select(
             'username,browser_profile'
-        ).eq('platform', platform).eq('is_active', True).execute()
+        ).eq('platform', platform).execute()
         
         if response.data:
             # Filter out accounts without browser profiles
@@ -2576,13 +2672,20 @@ async def run_campaign_preflight_checks(campaign: dict) -> PreFlightCheckResult:
     errors = []
     
     # Check 1: Required campaign fields
-    required_fields = ['campaign_id', 'user_accounts', 'target_profiles', 'custom_comment', 'platform']
+    required_fields = ['campaign_id', 'user_accounts', 'target_profiles', 'platform']
     for field in required_fields:
         if field not in campaign or not campaign[field]:
             errors.append(f'Missing required field: {field}')
-    
+
     if errors:
         return PreFlightCheckResult(False, "Campaign missing required configuration", errors)
+
+    # A campaign must have either comment text OR media attachments (or both)
+    has_comment = bool(campaign.get('custom_comment', ''))
+    has_media = bool(campaign.get('media_attachments'))
+    if not has_comment and not has_media:
+        errors.append('Campaign must have either comment text or media attachments')
+        return PreFlightCheckResult(False, "No content: provide custom_comment, media_attachments, or both", errors)
     
     # Extract platform early for platform-specific checks
     platform = campaign.get('platform', 'instagram')
@@ -2649,22 +2752,20 @@ async def run_campaign_preflight_checks(campaign: dict) -> PreFlightCheckResult:
     )
 
 
-async def run_automation_with_dolphin_anty():
+async def run_automation_with_dolphin_anty(campaign_id: str = None):
     """
     Main function to run Playwright automation using Dolphin Anty's anti-detect browser.
     
-    Queue processing:
-    1. Get pending campaigns ordered by queue_position
-    2. For EACH campaign:
-       a. Run pre-flight checks
-       b. If checks FAIL: log errors, skip to next campaign (leave status as 'not-started')
-       c. If checks PASS: change status to 'in-progress' and run campaign
-       d. On completion: change status to 'completed'
-    3. Return results for all campaigns
+    When campaign_id is provided, only that specific campaign is processed.
+    When campaign_id is None, falls back to processing all pending campaigns
+    ordered by queue_position (backward-compat).
     """
     
-    # Get pending campaigns from database
-    campaigns = get_next_campaigns()
+    # Get campaign(s) to process
+    if campaign_id:
+        campaigns = get_campaign_by_id(campaign_id)
+    else:
+        campaigns = get_next_campaigns()
     
     if not campaigns:
         print('[INFO] No campaigns to process. Exiting.')
@@ -2733,7 +2834,31 @@ async def run_automation_with_dolphin_anty():
             
             # Skip to next campaign
             continue
-        
+
+        # ====================================================================
+        # MEDIA PRE-FLIGHT CHECK: Verify storage files exist before proceeding
+        # ====================================================================
+        media_attachments = campaign.get('media_attachments') or []
+        if media_attachments:
+            print(f'[CHECK] Verifying {len(media_attachments)} media attachment(s) in storage for campaign {campaign_id}...')
+            all_exist, missing_paths = verify_media_exists_in_storage(media_attachments)
+            if not all_exist:
+                print(f'[SKIP] Campaign {campaign_id}: media file(s) missing from storage: {missing_paths}')
+                for mp in missing_paths:
+                    progress.warning(f'Media file missing from storage: {mp}')
+                try:
+                    update_campaign_status(campaign_id, 'failed')
+                    print(f'[STATUS] Campaign {campaign_id} marked as failed due to missing media files')
+                except Exception as e:
+                    print(f'[WARN] Could not update campaign status: {e}')
+                campaign_results.append({
+                    'campaign_id': campaign_id,
+                    'status': 'skipped',
+                    'reason': 'Media files missing from storage',
+                    'errors': missing_paths
+                })
+                continue
+
         # Extract platform for logging
         platform = campaign.get('platform', 'instagram')
         platform_label = 'X/Twitter' if platform == 'x' else platform.capitalize()
@@ -2754,7 +2879,7 @@ async def run_automation_with_dolphin_anty():
         # Extract campaign configuration (platform already extracted above)
         user_accounts = campaign.get('user_accounts', [])
         target_users = campaign.get('target_profiles', [])
-        comment_text = campaign.get('custom_comment', 'Great post!')
+        comment_text = campaign.get('custom_comment') or ''
         
         # Backwards compatibility: default to 15 seconds if post_delay is not set or is None
         post_delay = campaign.get('post_delay')
@@ -2779,7 +2904,32 @@ async def run_automation_with_dolphin_anty():
         else:
             mode = 'date'
             date_threshold = datetime.now() - timedelta(days=7)
-        
+
+        # ====================================================================
+        # MEDIA DOWNLOAD: Fetch attachments to local disk before account loop
+        # ====================================================================
+        if media_attachments:
+            print(f'[MEDIA] Downloading {len(media_attachments)} attachment(s) for campaign {campaign_id}...')
+            try:
+                local_media_paths = download_campaign_media(campaign_id, media_attachments)
+                print(f'[MEDIA] Downloaded {len(local_media_paths)} file(s) to local temp for campaign {campaign_id}')
+            except RuntimeError as e:
+                print(f'[ERR] Media download failed for campaign {campaign_id}: {e}')
+                progress.error(f'Media download failed for campaign {campaign_id}')
+                try:
+                    update_campaign_status(campaign_id, 'failed')
+                    print(f'[STATUS] Campaign {campaign_id} marked as failed due to media download error')
+                except Exception as ue:
+                    print(f'[WARN] Could not update campaign status: {ue}')
+                campaign_results.append({
+                    'campaign_id': campaign_id,
+                    'status': 'failed',
+                    'reason': str(e)
+                })
+                continue
+        else:
+            local_media_paths = []
+
         # ====================================================================
         # STEP 3: PROCESS EACH USER ACCOUNT IN SEQUENCE
         # Each account runs in its own browser profile with the same criteria
@@ -2787,6 +2937,9 @@ async def run_automation_with_dolphin_anty():
         
         campaign_success = False
         all_accounts_successful = True
+        at_least_one_account_succeeded = False  # Track if any account worked
+        accounts_tried = 0
+        accounts_failed = 0
         
         for account_idx, account_username in enumerate(user_accounts, 1):
             # Check for abort signal before processing each account
@@ -2800,20 +2953,10 @@ async def run_automation_with_dolphin_anty():
             print(f'[ACCOUNT] {account_idx}/{len(user_accounts)}: @{account_username}')
             print('='*70)
             
-            # Check if account is still active before processing
-            print(f'[CHECK] Verifying account @{account_username} is active...')
-            account_validation = validate_accounts_status([account_username], platform)
-            
-            if not account_validation['valid']:
-                print(f'[ERR] Account @{account_username} is suspended or inactive')
-                progress.error(f'Campaign failed: Account @{account_username} is suspended')
-                
-                # Mark campaign as failed and stop
-                update_campaign_status(campaign_id, 'failed')
-                all_accounts_successful = False
-                break
-            
-            print(f'[OK] Account @{account_username} is active')
+            # Note: We no longer check is_active status before processing
+            # Inactive accounts will be tried and skipped only if they encounter actual roadblocks
+            # This allows manually-resolved accounts to be retried without database updates
+            print(f'[INFO] Attempting to use account @{account_username}...')
             
             # Get credentials for this account
             credentials = get_account_credentials(account_username, platform)
@@ -2985,6 +3128,13 @@ async def run_automation_with_dolphin_anty():
                             target_user=first_target
                         )
                         progress.login_success(account_creds_username)
+                        
+                        # Reactivate account if it was previously inactive (passed bot check)
+                        is_active = credentials.get('is_active')
+                        print(f'[DEBUG] Account @{account_creds_username} is_active value: {is_active} (type: {type(is_active).__name__})')
+                        if is_active is False or is_active == 'false' or is_active == 0:
+                            reactivate_account(account_creds_username, platform)
+                            print(f'[OK] Account @{account_creds_username} passed verification - reactivated')
                     except Exception as login_error:
                         progress.login_failed(account_creds_username, str(login_error)[:100])
                         raise
@@ -3016,7 +3166,8 @@ async def run_automation_with_dolphin_anty():
                                 post_count=post_count,
                                 comment_text=comment_text,
                                 logger=user_logger,
-                                post_delay=post_delay
+                                post_delay=post_delay,
+                                local_media_paths=local_media_paths,
                             )
                         else:
                             post_result = await twitter_bot.process_posts_after_date(
@@ -3025,7 +3176,109 @@ async def run_automation_with_dolphin_anty():
                                 date_threshold=date_threshold,
                                 comment_text=comment_text,
                                 logger=user_logger,
-                                post_delay=post_delay
+                                post_delay=post_delay,
+                                local_media_paths=local_media_paths,
+                            )
+                        
+                        print(f'\n[OK] COMPLETED @{target_user}')
+                        user_logger.print_summary(stopped_early=post_result.get("stopped_early", False))
+                        
+                        comments_posted = post_result.get('posts_commented', 0)
+                        progress.target_completed(target_user, comments_posted)
+                        
+                        all_results.append({
+                            "target_user": target_user,
+                            "result": post_result
+                        })
+                        
+                        if idx < len(target_users):
+                            await do_profile_to_profile_delay(idx, logger)
+                
+                elif platform == 'threads':
+                    # Threads automation
+                    print('='*50)
+                    print('🧵 STARTING THREADS AUTOMATION (Playwright)')
+                    print('='*50 + '\n')
+                    
+                    # Create human-like functions dict for ThreadsAutomation
+                    human_like_funcs = {
+                        'human_like_click': human_like_click,
+                        'human_like_type': human_like_type,
+                        'human_like_mouse_move': human_like_mouse_move,
+                        'get_random_delay': get_random_delay,
+                        'do_review_pause': do_review_pause,
+                        'do_post_to_post_delay': do_post_to_post_delay,
+                        'do_profile_to_profile_delay': do_profile_to_profile_delay,
+                        'navigate_with_retry': navigate_with_retry,
+                    }
+                    
+                    # Initialize Threads automation
+                    threads_bot = ThreadsAutomation(
+                        progress_emitter=progress,
+                        event_store=event_store,
+                        human_like_funcs=human_like_funcs
+                    )
+                    
+                    first_target = target_users[0]
+                    progress.logging_in(account_creds_username)
+                    try:
+                        await threads_bot.login(
+                            page=page,
+                            username=account_creds_username,
+                            password=account_creds_password,
+                            target_user=first_target
+                        )
+                        progress.login_success(account_creds_username)
+                        
+                        # Reactivate account if it was previously inactive (passed bot check)
+                        is_active = credentials.get('is_active')
+                        print(f'[DEBUG] Account @{account_creds_username} is_active value: {is_active} (type: {type(is_active).__name__})')
+                        if is_active is False or is_active == 'false' or is_active == 0:
+                            reactivate_account(account_creds_username, platform)
+                            print(f'[OK] Account @{account_creds_username} passed verification - reactivated')
+                    except Exception as login_error:
+                        progress.login_failed(account_creds_username, str(login_error)[:100])
+                        raise
+                    
+                    print('\n' + '='*50)
+                    print('[OK] LOGIN PHASE COMPLETED!')
+                    print('='*50)
+                    
+                    # Process posts for each target user
+                    all_results = []
+                    
+                    for idx, target_user in enumerate(target_users, 1):
+                        if event_store.is_aborted():
+                            print('\n[ABORT] Abort signal detected - stopping target processing')
+                            progress.warning('Skipping remaining targets due to abort')
+                            break
+                        
+                        print('\n' + '='*50)
+                        print(f'[PROFILE] PROCESSING TARGET {idx}/{len(target_users)}: @{target_user}')
+                        print('='*50)
+                        
+                        progress.navigating_to_profile(target_user)
+                        user_logger = AutomationLogger()
+                        
+                        if mode == 'count':
+                            post_result = await threads_bot.process_posts_by_count(
+                                page=page,
+                                target_user=target_user,
+                                post_count=post_count,
+                                comment_text=comment_text,
+                                logger=user_logger,
+                                post_delay=post_delay,
+                                local_media_paths=local_media_paths,
+                            )
+                        else:
+                            post_result = await threads_bot.process_posts_after_date(
+                                page=page,
+                                target_user=target_user,
+                                date_threshold=date_threshold,
+                                comment_text=comment_text,
+                                logger=user_logger,
+                                post_delay=post_delay,
+                                local_media_paths=local_media_paths,
                             )
                         
                         print(f'\n[OK] COMPLETED @{target_user}')
@@ -3077,6 +3330,11 @@ async def run_automation_with_dolphin_anty():
                             target_user=first_target
                         )
                         progress.login_success(account_creds_username)
+                        
+                        # Reactivate account if it was previously inactive (passed bot check)
+                        if credentials.get('is_active') == False:
+                            reactivate_account(account_creds_username, platform)
+                            print(f'[OK] Account @{account_creds_username} passed verification - reactivated')
                     except Exception as login_error:
                         progress.login_failed(account_creds_username, str(login_error)[:100])
                         raise  # Re-raise to be caught by outer exception handler
@@ -3151,6 +3409,7 @@ async def run_automation_with_dolphin_anty():
                     print(f'  Stopped Early: {result.get("stopped_early", False)}')
                 
                 account_success = True
+                at_least_one_account_succeeded = True  # Mark that we had at least one success
                 
                 if account_success:
                     print(f'\n[OK] Account @{account_creds_username} completed successfully')
@@ -3160,6 +3419,8 @@ async def run_automation_with_dolphin_anty():
                 
             except Exception as e:
                 print(f'\n[ERR] Account automation error for @{account_creds_username}: {e}')
+                accounts_tried += 1
+                accounts_failed += 1
                 
                 # Check if it's an abort signal
                 if event_store.is_aborted():
@@ -3173,18 +3434,19 @@ async def run_automation_with_dolphin_anty():
                 elif ('bot challenge' in str(e).lower() or 
                       'human verification' in str(e).lower() or 
                       'account suspended' in str(e).lower() or
-                      'phone verification' in str(e).lower()):
-                    print(f'[ERR] {platform_label} account suspended - account @{account_creds_username} is flagged')
-                    progress.error(f'Campaign failed: Account @{account_creds_username} is suspended')
+                      'phone verification' in str(e).lower() or
+                      'login failed' in str(e).lower()):
+                    print(f'[WARN] {platform_label} account @{account_creds_username} encountered a roadblock')
+                    progress.warning(f'Account @{account_creds_username} blocked - will try next account')
                     
-                    # Deactivate the suspended account
+                    # Deactivate the blocked account so it's skipped in future campaigns
                     deactivate_account(account_creds_username, platform)
+                    print(f'[INFO] Account @{account_creds_username} marked as inactive')
                     
-                    # Mark campaign as failed
-                    update_campaign_status(campaign_id, 'failed')
+                    # DON'T fail the campaign - continue to try next account
                     all_accounts_successful = False
-                    # Break out of account loop - no point trying other accounts
-                    break
+                    # Continue to next account instead of breaking
+                    # The finally block will handle cleanup
                 else:
                     progress.error(f'Error with @{account_creds_username}: {str(e)[:100]}')
                 
@@ -3221,7 +3483,8 @@ async def run_automation_with_dolphin_anty():
                     await asyncio.sleep(delay_time)
         
         # Update campaign status based on overall success
-        campaign_success = all_accounts_successful
+        # Campaign is successful if at least one account completed successfully
+        campaign_success = at_least_one_account_succeeded
         
         # Check if campaign was aborted
         if event_store.is_aborted():
@@ -3234,7 +3497,10 @@ async def run_automation_with_dolphin_anty():
             update_campaign_status(campaign_id, 'aborted')
             progress.warning(f'Campaign {campaign_id} aborted')
         elif campaign_success:
-            print(f'\n[OK] All {len(user_accounts)} account(s) completed successfully')
+            if all_accounts_successful:
+                print(f'\n[OK] All {len(user_accounts)} account(s) completed successfully')
+            else:
+                print(f'\n[OK] Campaign completed ({accounts_failed} account(s) had issues but at least one succeeded)')
             campaign_results.append({
                 'campaign_id': campaign_id,
                 'status': 'completed'
@@ -3244,27 +3510,26 @@ async def run_automation_with_dolphin_anty():
             update_campaign_status(campaign_id, 'completed')
             progress.campaign_completed()
         else:
-            print(f'\n[WARN] Some accounts failed or encountered errors')
-            # Check if already marked as failed (bot challenge)
-            # If not, mark as failed now
-            try:
-                supabase = get_supabase_client()
-                current_status = supabase.table('comment_campaigns').select('status').eq('campaign_id', campaign_id).execute()
-                if current_status.data and current_status.data[0]['status'] != 'failed':
-                    print(f'\n[STATUS] Updating campaign status to: failed')
-                    update_campaign_status(campaign_id, 'failed')
-                else:
-                    print(f'\n[STATUS] Campaign already marked as failed')
-            except:
-                print(f'\n[STATUS] Updating campaign status to: failed')
-                update_campaign_status(campaign_id, 'failed')
+            print(f'\n[ERR] All {len(user_accounts)} account(s) failed or encountered errors')
+            # All accounts failed - mark campaign as failed
+            print(f'\n[STATUS] Updating campaign status to: failed')
+            update_campaign_status(campaign_id, 'failed')
             
             campaign_results.append({
                 'campaign_id': campaign_id,
                 'status': 'failed'
             })
-            progress.error(f'Campaign {campaign_id} failed - check logs for details')
-        
+            progress.error(f'Campaign {campaign_id} failed - all accounts blocked or errored')
+
+        # ====================================================================
+        # POST-CAMPAIGN MEDIA CLEANUP (unconditional — runs after all outcomes)
+        # Tier 1: delete local temp directory for this campaign.
+        # Tier 2: delete remote storage files if any were attached.
+        # ====================================================================
+        delete_local_campaign_dir(campaign_id)
+        if media_attachments:
+            delete_campaign_media_from_storage(media_attachments)
+
         # Delay between campaigns
         if campaign_idx < len(campaigns):
             delay_time = random.uniform(30, 60)
@@ -3290,55 +3555,8 @@ async def run_automation_with_dolphin_anty():
     return campaign_results
 
 
-def campaign_polling_worker():
-    """
-    Background worker that polls for new campaigns every 10 seconds.
-    This is a fallback for when webhooks can't reach localhost (Supabase cloud limitation).
-    """
-    import time
-    print('[POLLING] Campaign polling worker started (checks every 10s)')
-    
-    while True:
-        try:
-            time.sleep(10)  # Check every 10 seconds
-            
-            # Check if automation is already running
-            if event_store.status == 'running':
-                continue
-            
-            # Check for pending campaigns
-            pending = get_next_campaigns()
-            if pending and event_store.status != 'running':
-                print(f'\n[POLLING] ✨ Detected {len(pending)} new campaign(s)! Auto-starting automation...')
-                # Start automation in background thread
-                thread = threading.Thread(target=run_automation_in_thread, daemon=True)
-                thread.start()
-        except Exception as e:
-            print(f'[POLLING] Error checking for campaigns: {e}')
-            # Continue polling even if there's an error
-
-
-# ===========================================
-# BACKGROUND WORKERS
-# ===========================================
-
-_workers_started = False
-
-def start_background_workers():
-    """Start background workers for production deployment"""
-    global _workers_started
-    if _workers_started:
-        return  # Prevent double-start
-    
-    _workers_started = True
-    polling_thread = threading.Thread(target=campaign_polling_worker, daemon=True)
-    polling_thread.start()
-    print('[WORKER] Background polling worker started')
-
-
-# Auto-start workers when running under gunicorn or on Render
-if IS_PRODUCTION:
-    start_background_workers()
+# Manual-start mode: campaigns are started explicitly via POST /api/start
+# No background polling worker — this keeps full control with the operator.
 
 
 if __name__ == '__main__':
@@ -3351,22 +3569,7 @@ if __name__ == '__main__':
         print(f'[API] Event Feed: http://localhost:{PORT}/api/progress/events')
         print(f'[ENV] Production mode: {IS_PRODUCTION}')
         
-        # Always start background workers for API mode (not just in production)
-        # This ensures campaign polling works regardless of IS_PRODUCTION flag
-        start_background_workers()
-        
-        # Check for pending campaigns and auto-start if any exist
-        try:
-            pending = get_next_campaigns()
-            if pending:
-                print(f'[AUTO-START] Found {len(pending)} pending campaign(s), starting automation...')
-                # Start automation in background thread automatically
-                thread = threading.Thread(target=run_automation_in_thread, daemon=True)
-                thread.start()
-            else:
-                print('[INFO] No pending campaigns found. Polling worker will auto-detect new campaigns...')
-        except Exception as e:
-            print(f'[WARN] Could not check for pending campaigns: {e}')
+        print('[INFO] Manual-start mode — send POST /api/start to begin automation')
         
         # Use production-appropriate server settings
         if IS_PRODUCTION:
