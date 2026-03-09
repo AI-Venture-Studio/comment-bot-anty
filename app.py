@@ -28,6 +28,7 @@ from media_manager import (
     delete_local_campaign_dir,
     delete_campaign_media_from_storage,
 )
+import lock_manager
 
 dotenv.load_dotenv()
 init_media_manager()
@@ -128,6 +129,7 @@ class EventStore:
         self.latest_sentence = "Waiting to start..."
         self.abort_signal = False
         self.comment_count = 0  # Track total successful comments
+        self.locked_accounts: list = []
         
     def add_checkpoint(self, event_type: str, status: str, message: str,
                        target: str = None, index: int = None, total: int = None):
@@ -238,7 +240,8 @@ class EventStore:
                 'progress': self.current_progress,
                 'latest_sentence': self.latest_sentence,
                 'total_events': len(self.checkpoints),
-                'comment_count': self.comment_count
+                'comment_count': self.comment_count,
+                'locked_accounts': list(self.locked_accounts),
             }
     
     def set_status(self, status: str):
@@ -271,6 +274,7 @@ class EventStore:
             self.latest_sentence = "Waiting to start..."
             self.abort_signal = False
             self.comment_count = 0
+            self.locked_accounts = []
 
 # Global event store instance
 event_store = EventStore()
@@ -2716,7 +2720,14 @@ async def run_campaign_preflight_checks(campaign: dict) -> PreFlightCheckResult:
     if not browser_profile_name:
         errors.append(f'No browser profile assigned to {platform_label} account @{account_username}')
         return PreFlightCheckResult(False, f"Browser profile not assigned to @{account_username}", errors)
-    
+
+    # Check 4c: Accounts not locked by another bot
+    locked = lock_manager.check_locked_accounts(user_accounts, platform)
+    if locked:
+        names = ", ".join(f"@{u} (held by {owner.split(':')[0]})" for u, owner in locked.items())
+        errors.append(f"Accounts in use by another bot: {names}")
+        return PreFlightCheckResult(False, "Accounts currently in use by another bot", errors)
+
     # Check 5: Dolphin Anty connection
     dolphin = DolphinAntyClient()
     
@@ -3002,7 +3013,16 @@ async def run_automation_with_dolphin_anty(campaign_id: str = None):
             playwright = None
             browser = None
             profile_id = None
-            
+
+            # ── Acquire cross-bot lock ─────────────────────────────────────
+            bot_id = f"comment-bot:{campaign_id}"
+            if not lock_manager.acquire_lock(account_username, platform, bot_id):
+                print(f'[LOCK] @{account_username} is in use by another bot — skipping')
+                progress.warning(f'@{account_username} in use by another bot — skipped')
+                event_store.locked_accounts.append(account_username)
+                all_accounts_successful = False
+                continue
+
             try:
                 # Connect to Dolphin Anty and show detailed connection info
                 if not dolphin.login(show_progress=True):
@@ -3470,7 +3490,13 @@ async def run_automation_with_dolphin_anty(campaign_id: str = None):
                         print(f'[OK] Browser profile stopped')
                 except Exception as e:
                     print(f'[WARN] Could not stop profile: {e}')
-                
+
+                # Release cross-bot lock (always, even on error)
+                try:
+                    lock_manager.release_lock(account_username, platform, f"comment-bot:{campaign_id}")
+                except Exception:
+                    pass
+
                 # Check for abort before proceeding to next account
                 if event_store.is_aborted():
                     print(f'\n[ABORT] Abort signal detected - skipping remaining accounts')
