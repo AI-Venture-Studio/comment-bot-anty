@@ -109,3 +109,13 @@
 2026-03-10 20:02:43 | INFO    | [SERVER] Development mode - debug enabled
 2026-03-10 20:02:43 | WARNING |  * Debugger is active!
 2026-03-10 20:02:43 | INFO    |  * Debugger PIN: 376-490-533
+2026-03-10 20:24:19 | INFO    |  * Detected change in '/Users/amo-korankye/Desktop/amokorankye/dev/AIVS/click-creators-comprehensive/comment-bot-server/app.py', reloading
+2026-03-10 20:24:21 | INFO    | [SERVER] Starting Social Media Comment Bot API Server...
+2026-03-10 20:24:21 | INFO    | [API] Documentation: http://localhost:5001/api/docs
+2026-03-10 20:24:21 | INFO    | [API] Current Progress: http://localhost:5001/api/progress/current
+2026-03-10 20:24:21 | INFO    | [API] Event Feed: http://localhost:5001/api/progress/events
+2026-03-10 20:24:21 | INFO    | [ENV] Production mode: None
+2026-03-10 20:24:21 | INFO    | [INFO] Manual-start mode — send POST /api/start to begin automation
+2026-03-10 20:24:21 | INFO    | [SERVER] Development mode - debug enabled
+2026-03-10 20:24:21 | WARNING |  * Debugger is active!
+2026-03-10 20:24:21 | INFO    |  * Debugger PIN: 376-490-533

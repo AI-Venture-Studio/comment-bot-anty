@@ -15,10 +15,9 @@ from pathlib import Path
 from typing import Dict, List, Optional
 from queue import Queue
 
-# Windows defaults to ProactorEventLoop which causes issues with
-# Playwright in background threads. Force SelectorEventLoop on Windows.
-if platform.system() == "Windows":
-    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+# Note: Windows defaults to ProactorEventLoop, which Playwright requires
+# for subprocess support. Do NOT switch to SelectorEventLoop — it lacks
+# subprocess_exec and causes NotImplementedError on connect.
 
 from playwright.async_api import async_playwright, Browser, BrowserContext, Page
 from supabase import create_client, Client
