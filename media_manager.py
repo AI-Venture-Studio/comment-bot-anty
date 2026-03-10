@@ -244,6 +244,29 @@ def download_campaign_media(
 
 
 # =============================================================================
+# PRIVATE: RETRY-AWARE DIRECTORY REMOVAL
+# =============================================================================
+
+def _rmtree_with_retry(path: Path, max_retries: int = 3, delay: float = 1.0) -> None:
+    """
+    Attempt shutil.rmtree with retries for Windows file lock scenarios.
+    Logs a warning if deletion fails after all retries (non-fatal).
+    """
+    for attempt in range(max_retries):
+        try:
+            shutil.rmtree(str(path))
+            return
+        except Exception as e:
+            if attempt < max_retries - 1:
+                time.sleep(delay)
+            else:
+                logger.warning(
+                    f"Could not delete {path} after {max_retries} attempts: {e}. "
+                    f"Orphan cleanup will handle it on next startup."
+                )
+
+
+# =============================================================================
 # PUBLIC: LOCAL CLEANUP (TIER 1 — per file)
 # =============================================================================
 
@@ -287,14 +310,8 @@ def delete_local_campaign_dir(campaign_id: str) -> None:
     campaign_dir = _temp_dir / campaign_id
     if not campaign_dir.exists():
         return
-    try:
-        shutil.rmtree(str(campaign_dir))
-        logger.info(f'[MEDIA] Deleted local campaign dir: {campaign_dir}')
-    except Exception as exc:
-        logger.warning(
-            f'[MEDIA] Could not delete campaign dir '
-            f'"{campaign_dir}" for campaign {campaign_id}: {exc}'
-        )
+    _rmtree_with_retry(campaign_dir)
+    logger.info(f'[MEDIA] Deleted local campaign dir: {campaign_dir}')
 
 
 # =============================================================================
@@ -376,6 +393,21 @@ def _cleanup_orphan_temp_files() -> None:
                     logger.warning(
                         f'[MEDIA] Orphan cleanup: could not process "{file_path}": {exc}'
                     )
+
+        # Second pass: remove empty subdirectories (bottom-up)
+        for dirpath, dirnames, filenames in os.walk(str(_temp_dir), topdown=False):
+            dir_path = Path(dirpath)
+            if dir_path == _temp_dir:
+                continue  # Never remove the root temp dir itself
+            try:
+                if not any(dir_path.iterdir()):
+                    dir_path.rmdir()
+                    logger.debug(f'[MEDIA] Orphan cleanup: removed empty dir {dir_path}')
+            except Exception as exc:
+                logger.warning(
+                    f'[MEDIA] Orphan cleanup: could not remove dir "{dir_path}": {exc}'
+                )
+
     except Exception as exc:
         logger.warning(f'[MEDIA] Orphan cleanup sweep failed: {exc}')
 

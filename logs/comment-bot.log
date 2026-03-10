@@ -1,0 +1,101 @@
+2026-03-10 18:58:39 | INFO    | [SERVER] Starting Social Media Comment Bot API Server...
+2026-03-10 18:58:39 | INFO    | [SERVER] Starting Social Media Comment Bot API Server...
+2026-03-10 18:58:39 | INFO    | [API] Documentation: http://localhost:5001/api/docs
+2026-03-10 18:58:39 | INFO    | [API] Documentation: http://localhost:5001/api/docs
+2026-03-10 18:58:39 | INFO    | [API] Current Progress: http://localhost:5001/api/progress/current
+2026-03-10 18:58:39 | INFO    | [API] Current Progress: http://localhost:5001/api/progress/current
+2026-03-10 18:58:39 | INFO    | [API] Event Feed: http://localhost:5001/api/progress/events
+2026-03-10 18:58:39 | INFO    | [API] Event Feed: http://localhost:5001/api/progress/events
+2026-03-10 18:58:39 | INFO    | [ENV] Production mode: None
+2026-03-10 18:58:39 | INFO    | [ENV] Production mode: None
+2026-03-10 18:58:39 | INFO    | [INFO] Manual-start mode — send POST /api/start to begin automation
+2026-03-10 18:58:39 | INFO    | [INFO] Manual-start mode — send POST /api/start to begin automation
+2026-03-10 18:58:39 | INFO    | [SERVER] Development mode - debug enabled
+2026-03-10 18:58:39 | INFO    | [SERVER] Development mode - debug enabled
+2026-03-10 18:58:39 | WARNING |  * Debugger is active!
+2026-03-10 18:58:39 | INFO    |  * Debugger PIN: 376-490-533
+2026-03-10 18:58:53 | INFO    |  * Detected change in '/Users/amo-korankye/Desktop/amokorankye/dev/AIVS/click-creators-comprehensive/comment-bot-server/app.py', reloading
+2026-03-10 18:58:54 | INFO    | [SERVER] Starting Social Media Comment Bot API Server...
+2026-03-10 18:58:54 | INFO    | [SERVER] Starting Social Media Comment Bot API Server...
+2026-03-10 18:58:54 | INFO    | [API] Documentation: http://localhost:5001/api/docs
+2026-03-10 18:58:54 | INFO    | [API] Documentation: http://localhost:5001/api/docs
+2026-03-10 18:58:54 | INFO    | [API] Current Progress: http://localhost:5001/api/progress/current
+2026-03-10 18:58:54 | INFO    | [API] Current Progress: http://localhost:5001/api/progress/current
+2026-03-10 18:58:54 | INFO    | [API] Event Feed: http://localhost:5001/api/progress/events
+2026-03-10 18:58:54 | INFO    | [API] Event Feed: http://localhost:5001/api/progress/events
+2026-03-10 18:58:54 | INFO    | [ENV] Production mode: None
+2026-03-10 18:58:54 | INFO    | [ENV] Production mode: None
+2026-03-10 18:58:54 | INFO    | [INFO] Manual-start mode — send POST /api/start to begin automation
+2026-03-10 18:58:54 | INFO    | [INFO] Manual-start mode — send POST /api/start to begin automation
+2026-03-10 18:58:54 | INFO    | [SERVER] Development mode - debug enabled
+2026-03-10 18:58:54 | INFO    | [SERVER] Development mode - debug enabled
+2026-03-10 18:58:54 | WARNING |  * Debugger is active!
+2026-03-10 18:58:54 | INFO    |  * Debugger PIN: 376-490-533
+2026-03-10 18:59:11 | INFO    |  * Detected change in '/Users/amo-korankye/Desktop/amokorankye/dev/AIVS/click-creators-comprehensive/comment-bot-server/app.py', reloading
+2026-03-10 18:59:12 | INFO    | [SERVER] Starting Social Media Comment Bot API Server...
+2026-03-10 18:59:12 | INFO    | [SERVER] Starting Social Media Comment Bot API Server...
+2026-03-10 18:59:12 | INFO    | [API] Documentation: http://localhost:5001/api/docs
+2026-03-10 18:59:12 | INFO    | [API] Documentation: http://localhost:5001/api/docs
+2026-03-10 18:59:12 | INFO    | [API] Current Progress: http://localhost:5001/api/progress/current
+2026-03-10 18:59:12 | INFO    | [API] Current Progress: http://localhost:5001/api/progress/current
+2026-03-10 18:59:12 | INFO    | [API] Event Feed: http://localhost:5001/api/progress/events
+2026-03-10 18:59:12 | INFO    | [API] Event Feed: http://localhost:5001/api/progress/events
+2026-03-10 18:59:12 | INFO    | [ENV] Production mode: None
+2026-03-10 18:59:12 | INFO    | [ENV] Production mode: None
+2026-03-10 18:59:12 | INFO    | [INFO] Manual-start mode — send POST /api/start to begin automation
+2026-03-10 18:59:12 | INFO    | [INFO] Manual-start mode — send POST /api/start to begin automation
+2026-03-10 18:59:12 | INFO    | [SERVER] Development mode - debug enabled
+2026-03-10 18:59:12 | INFO    | [SERVER] Development mode - debug enabled
+2026-03-10 18:59:12 | WARNING |  * Debugger is active!
+2026-03-10 18:59:12 | INFO    |  * Debugger PIN: 376-490-533
+2026-03-10 18:59:23 | INFO    |  * Detected change in '/Users/amo-korankye/Desktop/amokorankye/dev/AIVS/click-creators-comprehensive/comment-bot-server/media_manager.py', reloading
+2026-03-10 18:59:24 | INFO    | [SERVER] Starting Social Media Comment Bot API Server...
+2026-03-10 18:59:24 | INFO    | [SERVER] Starting Social Media Comment Bot API Server...
+2026-03-10 18:59:24 | INFO    | [API] Documentation: http://localhost:5001/api/docs
+2026-03-10 18:59:24 | INFO    | [API] Documentation: http://localhost:5001/api/docs
+2026-03-10 18:59:24 | INFO    | [API] Current Progress: http://localhost:5001/api/progress/current
+2026-03-10 18:59:24 | INFO    | [API] Current Progress: http://localhost:5001/api/progress/current
+2026-03-10 18:59:24 | INFO    | [API] Event Feed: http://localhost:5001/api/progress/events
+2026-03-10 18:59:24 | INFO    | [API] Event Feed: http://localhost:5001/api/progress/events
+2026-03-10 18:59:24 | INFO    | [ENV] Production mode: None
+2026-03-10 18:59:24 | INFO    | [ENV] Production mode: None
+2026-03-10 18:59:24 | INFO    | [INFO] Manual-start mode — send POST /api/start to begin automation
+2026-03-10 18:59:24 | INFO    | [INFO] Manual-start mode — send POST /api/start to begin automation
+2026-03-10 18:59:24 | INFO    | [SERVER] Development mode - debug enabled
+2026-03-10 18:59:24 | INFO    | [SERVER] Development mode - debug enabled
+2026-03-10 18:59:24 | WARNING |  * Debugger is active!
+2026-03-10 18:59:24 | INFO    |  * Debugger PIN: 376-490-533
+2026-03-10 18:59:31 | INFO    |  * Detected change in '/Users/amo-korankye/Desktop/amokorankye/dev/AIVS/click-creators-comprehensive/comment-bot-server/media_manager.py', reloading
+2026-03-10 18:59:33 | INFO    | [SERVER] Starting Social Media Comment Bot API Server...
+2026-03-10 18:59:33 | INFO    | [SERVER] Starting Social Media Comment Bot API Server...
+2026-03-10 18:59:33 | INFO    | [API] Documentation: http://localhost:5001/api/docs
+2026-03-10 18:59:33 | INFO    | [API] Documentation: http://localhost:5001/api/docs
+2026-03-10 18:59:33 | INFO    | [API] Current Progress: http://localhost:5001/api/progress/current
+2026-03-10 18:59:33 | INFO    | [API] Current Progress: http://localhost:5001/api/progress/current
+2026-03-10 18:59:33 | INFO    | [API] Event Feed: http://localhost:5001/api/progress/events
+2026-03-10 18:59:33 | INFO    | [API] Event Feed: http://localhost:5001/api/progress/events
+2026-03-10 18:59:33 | INFO    | [ENV] Production mode: None
+2026-03-10 18:59:33 | INFO    | [ENV] Production mode: None
+2026-03-10 18:59:33 | INFO    | [INFO] Manual-start mode — send POST /api/start to begin automation
+2026-03-10 18:59:33 | INFO    | [INFO] Manual-start mode — send POST /api/start to begin automation
+2026-03-10 18:59:33 | INFO    | [SERVER] Development mode - debug enabled
+2026-03-10 18:59:33 | INFO    | [SERVER] Development mode - debug enabled
+2026-03-10 18:59:33 | WARNING |  * Debugger is active!
+2026-03-10 18:59:33 | INFO    |  * Debugger PIN: 376-490-533
+2026-03-10 18:59:47 | INFO    |  * Detected change in '/Users/amo-korankye/Desktop/amokorankye/dev/AIVS/click-creators-comprehensive/comment-bot-server/media_manager.py', reloading
+2026-03-10 18:59:49 | INFO    | [SERVER] Starting Social Media Comment Bot API Server...
+2026-03-10 18:59:49 | INFO    | [SERVER] Starting Social Media Comment Bot API Server...
+2026-03-10 18:59:49 | INFO    | [API] Documentation: http://localhost:5001/api/docs
+2026-03-10 18:59:49 | INFO    | [API] Documentation: http://localhost:5001/api/docs
+2026-03-10 18:59:49 | INFO    | [API] Current Progress: http://localhost:5001/api/progress/current
+2026-03-10 18:59:49 | INFO    | [API] Current Progress: http://localhost:5001/api/progress/current
+2026-03-10 18:59:49 | INFO    | [API] Event Feed: http://localhost:5001/api/progress/events
+2026-03-10 18:59:49 | INFO    | [API] Event Feed: http://localhost:5001/api/progress/events
+2026-03-10 18:59:49 | INFO    | [ENV] Production mode: None
+2026-03-10 18:59:49 | INFO    | [ENV] Production mode: None
+2026-03-10 18:59:49 | INFO    | [INFO] Manual-start mode — send POST /api/start to begin automation
+2026-03-10 18:59:49 | INFO    | [INFO] Manual-start mode — send POST /api/start to begin automation
+2026-03-10 18:59:49 | INFO    | [SERVER] Development mode - debug enabled
+2026-03-10 18:59:49 | INFO    | [SERVER] Development mode - debug enabled
+2026-03-10 18:59:49 | WARNING |  * Debugger is active!
+2026-03-10 18:59:49 | INFO    |  * Debugger PIN: 376-490-533
