@@ -106,6 +106,7 @@ def setup_logging() -> None:
     logger = logging.getLogger("comment-bot")
     logger.setLevel(logging.DEBUG)
     logger.addHandler(file_handler)
+    logger.propagate = False
 
     # Also configure root logger so third-party module loggers
     # (media_manager, lock_manager, etc.) get captured too
