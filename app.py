@@ -1006,7 +1006,31 @@ def start_automation():
     
     if not campaign_id:
         return jsonify({'error': 'campaign_id is required'}), 400
-    
+
+    # Fetch campaign to check lock state before spawning thread
+    _sb = get_supabase_client()
+    _camp_res = _sb.table('comment_campaigns').select('user_accounts, platform, status').eq('campaign_id', campaign_id).limit(1).execute()
+    if not _camp_res.data:
+        return jsonify({'error': 'Campaign not found'}), 404
+
+    _camp = _camp_res.data[0]
+    if _camp.get('status') != 'not-started':
+        return jsonify({'error': f"Campaign cannot be started (status: {_camp['status']})"}), 409
+
+    _user_accounts = _camp.get('user_accounts') or []
+    _platform = _camp.get('platform')
+    if _user_accounts and _platform:
+        _locked = lock_manager.check_locked_accounts(_user_accounts, _platform)
+        if _locked:
+            _names = ", ".join(
+                f"@{u} (held by {owner.split(':')[0]})"
+                for u, owner in _locked.items()
+            )
+            return jsonify({
+                'error': f"Accounts currently in use: {_names}",
+                'locked_accounts': _locked,
+            }), 409
+
     # Start automation in background thread for the specific campaign
     thread = threading.Thread(
         target=run_automation_in_thread,
@@ -1093,6 +1117,18 @@ def abort_automation():
             'status': 'unknown',
             'message': f'Unexpected status: {current_status}'
         }), 400
+
+
+@app.route('/api/locked-accounts', methods=['POST'])
+def locked_accounts():
+    """Return which of the given accounts are currently locked."""
+    data = request.get_json(silent=True) or {}
+    usernames = data.get('usernames', [])
+    platform = data.get('platform', '')
+    if not usernames or not platform:
+        return jsonify({'locked': {}})
+    locked = lock_manager.check_locked_accounts(usernames, platform)
+    return jsonify({'locked': locked})
 
 
 @app.route('/api/webhook/campaign-added', methods=['POST'])
@@ -2721,13 +2757,6 @@ async def run_campaign_preflight_checks(campaign: dict) -> PreFlightCheckResult:
         errors.append(f'No browser profile assigned to {platform_label} account @{account_username}')
         return PreFlightCheckResult(False, f"Browser profile not assigned to @{account_username}", errors)
 
-    # Check 4c: Accounts not locked by another bot
-    locked = lock_manager.check_locked_accounts(user_accounts, platform)
-    if locked:
-        names = ", ".join(f"@{u} (held by {owner.split(':')[0]})" for u, owner in locked.items())
-        errors.append(f"Accounts in use by another bot: {names}")
-        return PreFlightCheckResult(False, "Accounts currently in use by another bot", errors)
-
     # Check 5: Dolphin Anty connection
     dolphin = DolphinAntyClient()
     
@@ -3013,6 +3042,7 @@ async def run_automation_with_dolphin_anty(campaign_id: str = None):
             playwright = None
             browser = None
             profile_id = None
+            page = None
 
             # ── Acquire cross-bot lock ─────────────────────────────────────
             bot_id = f"comment-bot:{campaign_id}"
