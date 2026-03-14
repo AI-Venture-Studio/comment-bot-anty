@@ -119,3 +119,30 @@
 2026-03-10 20:24:21 | INFO    | [SERVER] Development mode - debug enabled
 2026-03-10 20:24:21 | WARNING |  * Debugger is active!
 2026-03-10 20:24:21 | INFO    |  * Debugger PIN: 376-490-533
+2026-03-12 18:33:31 | INFO    | [SERVER] Starting Social Media Comment Bot API Server...
+2026-03-12 18:33:31 | INFO    | [API] Documentation: http://localhost:5001/api/docs
+2026-03-12 18:33:31 | INFO    | [API] Current Progress: http://localhost:5001/api/progress/current
+2026-03-12 18:33:31 | INFO    | [API] Event Feed: http://localhost:5001/api/progress/events
+2026-03-12 18:33:31 | INFO    | [ENV] Production mode: None
+2026-03-12 18:33:31 | INFO    | [INFO] Manual-start mode — send POST /api/start to begin automation
+2026-03-12 18:33:31 | INFO    | [SERVER] Development mode - debug enabled
+2026-03-12 18:33:31 | INFO    | * Serving Flask app 'app'
+2026-03-12 18:33:31 | INFO    | * Debug mode: on
+2026-03-12 18:33:31 | INFO    | [31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on all addresses (0.0.0.0)
+ * Running on http://127.0.0.1:5001
+ * Running on http://192.168.100.163:5001
+2026-03-12 18:33:31 | INFO    | [33mPress CTRL+C to quit[0m
+2026-03-12 18:33:31 | INFO    |  * Restarting with stat
+2026-03-12 18:33:33 | INFO    | [SERVER] Starting Social Media Comment Bot API Server...
+2026-03-12 18:33:33 | INFO    | [API] Documentation: http://localhost:5001/api/docs
+2026-03-12 18:33:33 | INFO    | [API] Current Progress: http://localhost:5001/api/progress/current
+2026-03-12 18:33:33 | INFO    | [API] Event Feed: http://localhost:5001/api/progress/events
+2026-03-12 18:33:33 | INFO    | [ENV] Production mode: None
+2026-03-12 18:33:33 | INFO    | [INFO] Manual-start mode — send POST /api/start to begin automation
+2026-03-12 18:33:33 | INFO    | [SERVER] Development mode - debug enabled
+2026-03-12 18:33:33 | WARNING |  * Debugger is active!
+2026-03-12 18:33:33 | INFO    |  * Debugger PIN: 144-924-873
+2026-03-12 18:33:47 | DEBUG   | 127.0.0.1 - - [12/Mar/2026 18:33:47] "GET /api/progress/events HTTP/1.1" 200 -
+2026-03-12 18:33:47 | INFO    | 127.0.0.1 - - [12/Mar/2026 18:33:47] "[33mGET /favicon.ico HTTP/1.1[0m" 404 -
+2026-03-12 18:33:56 | DEBUG   | 127.0.0.1 - - [12/Mar/2026 18:33:56] "GET / HTTP/1.1" 200 -
