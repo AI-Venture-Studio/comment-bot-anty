@@ -323,6 +323,7 @@ class ProgressEmitter:
     
     def campaign_starting(self):
         """Checkpoint: Campaign is starting"""
+        event_store.set_progress(0)
         event_store.add_checkpoint(
             event_type='campaign',
             status='success',
@@ -3572,11 +3573,14 @@ async def run_automation_with_dolphin_anty(campaign_id: str = None):
                 except Exception:
                     pass
 
+                # Update progress after each account
+                event_store.set_progress(int((account_idx / len(user_accounts)) * 95))
+
                 # Check for abort before proceeding to next account
                 if event_store.is_aborted():
                     print(f'\n[ABORT] Abort signal detected - skipping remaining accounts')
                     break
-                
+
                 # Delay before next account (if not the last one)
                 if account_idx < len(user_accounts):
                     delay_time = random.uniform(10, 20)
