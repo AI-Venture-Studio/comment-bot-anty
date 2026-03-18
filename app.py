@@ -137,6 +137,7 @@ class EventStore:
         self.latest_sentence = "Waiting to start..."
         self.abort_signal = False
         self.comment_count = 0  # Track total successful comments
+        self.expected_total = 0  # Expected total comments this session (count mode)
         self.locked_accounts: list = []
         
     def add_checkpoint(self, event_type: str, status: str, message: str,
@@ -169,6 +170,11 @@ class EventStore:
             # Update comment count on successful comment
             if event_type == 'comment' and status == 'success':
                 self.comment_count += 1
+                # Auto-advance progress bar per comment
+                if self.expected_total > 0:
+                    self.current_progress = min(95, int((self.comment_count / self.expected_total) * 95))
+                elif index is not None and total and total > 0:
+                    self.current_progress = min(95, int((index / total) * 95))
             
             # Determine category for legacy compatibility
             category = 'success' if status == 'success' else 'error'
@@ -261,7 +267,12 @@ class EventStore:
         """Update progress percentage"""
         with self.lock:
             self.current_progress = min(100, max(0, progress))
-    
+
+    def set_expected_total(self, total: int):
+        """Set expected comment total so progress auto-advances per comment."""
+        with self.lock:
+            self.expected_total = max(0, total)
+
     def set_abort(self):
         """Signal to abort the current automation"""
         with self.lock:
@@ -282,6 +293,7 @@ class EventStore:
             self.latest_sentence = "Waiting to start..."
             self.abort_signal = False
             self.comment_count = 0
+            self.expected_total = 0
             self.locked_accounts = []
 
 # Global event store instance
@@ -960,26 +972,44 @@ def get_checkpoints():
 def run_automation_in_thread(campaign_id: str = None):
     """Run automation in background thread for a specific campaign."""
     try:
-        event_store.clear()
-        event_store.set_status('running')
-        
+        # event_store is already cleared and set to 'running' by /api/start
         # Emit campaign starting checkpoint
         progress.campaign_starting()
-        
+
         # Run the async automation for the specified campaign
         asyncio.run(run_automation_with_dolphin_anty(campaign_id=campaign_id))
-        
+
         # Check if aborted
         if event_store.is_aborted():
             event_store.set_status('aborted')
             progress.campaign_aborted()
         else:
-            event_store.set_status('completed')
-            progress.campaign_completed()
-        
+            # Check the actual campaign outcome from the DB instead of
+            # blindly setting 'completed' (campaigns can fail gracefully
+            # without raising exceptions)
+            actual_status = _get_campaign_status_from_db(campaign_id)
+            if actual_status == 'failed':
+                event_store.set_status('error')
+                progress.campaign_failed('Campaign failed — all accounts encountered errors')
+            else:
+                event_store.set_status('completed')
+                progress.campaign_completed()
+
     except Exception as e:
         event_store.set_status('error')
         progress.campaign_failed(str(e))
+
+
+def _get_campaign_status_from_db(campaign_id: str) -> str:
+    """Read the campaign's current status from the database."""
+    try:
+        supabase = get_supabase_client()
+        res = supabase.table('comment_campaigns').select('status').eq('campaign_id', campaign_id).limit(1).execute()
+        if res.data:
+            return res.data[0].get('status', 'completed')
+        return 'completed'
+    except Exception:
+        return 'completed'
 
 
 @app.route('/api/start', methods=['POST'])
@@ -1040,6 +1070,11 @@ def start_automation():
                 'locked_accounts': _locked,
             }), 409
 
+    # Clear event_store BEFORE starting thread so the progress endpoint
+    # immediately returns 'running' (prevents stale status from previous campaign)
+    event_store.clear()
+    event_store.set_status('running')
+
     # Start automation in background thread for the specific campaign
     thread = threading.Thread(
         target=run_automation_in_thread,
@@ -1047,7 +1082,7 @@ def start_automation():
         daemon=True,
     )
     thread.start()
-    
+
     return jsonify({
         'status': 'started',
         'message': f'Campaign {campaign_id} started successfully'
@@ -3020,7 +3055,11 @@ async def run_automation_with_dolphin_anty(campaign_id: str = None):
         # STEP 3: PROCESS EACH USER ACCOUNT IN SEQUENCE
         # Each account runs in its own browser profile with the same criteria
         # ====================================================================
-        
+
+        # Pre-compute total expected comments for smooth per-comment progress (count mode only)
+        if mode == 'count':
+            event_store.set_expected_total(len(target_users) * post_count * len(user_accounts))
+
         campaign_success = False
         all_accounts_successful = True
         at_least_one_account_succeeded = False  # Track if any account worked
@@ -3096,6 +3135,14 @@ async def run_automation_with_dolphin_anty(campaign_id: str = None):
                 print(f'[LOCK] @{account_username} is in use by another bot — skipping')
                 progress.warning(f'@{account_username} in use by another bot — skipped')
                 event_store.locked_accounts.append(account_username)
+                all_accounts_successful = False
+                continue
+
+            # ── Acquire profile-level lock ─────────────────────────────────
+            if not lock_manager.acquire_profile_lock(browser_profile_name, bot_id):
+                print(f'[LOCK] Profile \'{browser_profile_name}\' is in use by another bot — skipping @{account_username}')
+                progress.warning(f"Profile '{browser_profile_name}' in use by another bot — skipped")
+                lock_manager.release_lock(account_username, platform, bot_id)
                 all_accounts_successful = False
                 continue
 
@@ -3567,7 +3614,13 @@ async def run_automation_with_dolphin_anty(campaign_id: str = None):
                 except Exception as e:
                     print(f'[WARN] Could not stop profile: {e}')
 
-                # Release cross-bot lock (always, even on error)
+                # Release profile lock
+                try:
+                    lock_manager.release_profile_lock(browser_profile_name, f"comment-bot:{campaign_id}")
+                except Exception:
+                    pass
+
+                # Release cross-bot account lock (always, even on error)
                 try:
                     lock_manager.release_lock(account_username, platform, f"comment-bot:{campaign_id}")
                 except Exception:
@@ -3613,7 +3666,6 @@ async def run_automation_with_dolphin_anty(campaign_id: str = None):
             # Update to completed
             print(f'\n[STATUS] Updating campaign status to: completed')
             update_campaign_status(campaign_id, 'completed')
-            progress.campaign_completed()
         else:
             print(f'\n[ERR] All {len(user_accounts)} account(s) failed or encountered errors')
             # All accounts failed - mark campaign as failed
